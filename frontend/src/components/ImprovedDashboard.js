@@ -23,6 +23,7 @@ import {
 import axios from 'axios';
 import { toast } from 'sonner';
 import ReviewDialog from './ReviewDialog';
+import { activeMatchStatuses, shipmentMatch, shipmentStatusLabel } from '../lib/matchLifecycle';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from './ui/alert-dialog';
 import { getTransportMode, formatTripPrice, TransportModeBadge } from './TransportModeBadge';
 
@@ -41,6 +42,7 @@ const ImprovedDashboard = () => {
   const [pendingReviews, setPendingReviews] = useState([]);
   const [myShipments, setMyShipments] = useState([]);
   const [myTrips, setMyTrips] = useState([]);
+  const [myMatches, setMyMatches] = useState([]);
   const [reviewDialog, setReviewDialog] = useState({ open: false, matchId: null, otherUser: null, shipmentDesc: '' });
   const [idUploading, setIdUploading] = useState(false);
 
@@ -63,6 +65,7 @@ const ImprovedDashboard = () => {
 
       setMyShipments(shipments);
       setMyTrips(trips);
+      setMyMatches(matches);
 
       // Calculate stats
       const completedShipments = shipments.filter(s => s.status === 'delivered').length;
@@ -72,7 +75,7 @@ const ImprovedDashboard = () => {
       setStats({
         totalShipments: shipments.length,
         totalTrips: trips.length,
-        activeMatches: matches.filter(m => m.status === 'active' || m.status === 'accepted').length,
+        activeMatches: matches.filter(m => activeMatchStatuses.includes(m.status)).length,
         completedDeliveries: completedShipments + completedTrips,
         totalValue
       });
@@ -86,6 +89,7 @@ const ImprovedDashboard = () => {
           type: 'shipment',
           title: shipment.description,
           status: shipment.status,
+          statusLabel: shipmentStatusLabel(shipment, shipmentMatch(matches, shipment.id)),
           time: shipment.created_at,
           link: `/shipment/${shipment.id}`
         });
@@ -327,6 +331,13 @@ const ImprovedDashboard = () => {
           </div>
         )}
 
+        <Card>
+          <CardContent className="p-4 flex flex-wrap items-center justify-between gap-3">
+            <div><p className="font-semibold">My Requests / Matches</p><p className="text-sm text-gray-600">Resume requests, messages, payments, and deliveries.</p></div>
+            <Button onClick={() => navigate('/match-requests')}>Open my requests ({stats.activeMatches})</Button>
+          </CardContent>
+        </Card>
+
         {/* Stats Grid */}
         <div className="grid grid-cols-2 md:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-6">
           {statCards.map((stat, index) => {
@@ -492,7 +503,7 @@ const ImprovedDashboard = () => {
                         </p>
                       </div>
                       <Badge className={`${getStatusColor(activity.status)} text-xs`}>
-                        {getStatusLabel(activity.status)}
+                        {activity.statusLabel || getStatusLabel(activity.status)}
                       </Badge>
                     </div>
                   ))}
@@ -539,7 +550,7 @@ const ImprovedDashboard = () => {
                     </div>
                     <div className="flex items-center gap-1.5 sm:gap-2 flex-shrink-0">
                       <Badge className={`${getStatusColor(shipment.status)} text-xs whitespace-nowrap`}>
-                        {getStatusLabel(shipment.status)}
+                        {shipmentStatusLabel(shipment, shipmentMatch(myMatches, shipment.id))}
                       </Badge>
                       <AlertDialog>
                         <AlertDialogTrigger asChild>

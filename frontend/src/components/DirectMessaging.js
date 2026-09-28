@@ -136,7 +136,7 @@ const DirectMessaging = () => {
           {otherUser?.id && (
             <Button variant="outline" size="sm" onClick={() => setMatchOpen(true)} className="flex-shrink-0 rounded-xl border-orange-200 text-orange-700 hover:bg-orange-50" data-testid="chat-request-match">
               <Handshake className="h-4 w-4 sm:mr-2" />
-              <span className="hidden sm:inline">Request Match</span>
+              <span className="hidden sm:inline">Requests / Match</span>
             </Button>
           )}
         </div>

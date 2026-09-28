@@ -5,6 +5,7 @@ import { Button } from './ui/button';
 import { CheckCircle, ArrowRight, Download, Star } from 'lucide-react';
 import { toast } from 'sonner';
 import axios from 'axios';
+import { openMatchConversation } from '../lib/messaging';
 
 const PaymentSuccess = () => {
   const navigate = useNavigate();
@@ -77,10 +78,10 @@ const PaymentSuccess = () => {
               We couldn't find your payment session. Please try again.
             </p>
             <Button 
-              onClick={() => navigate('/dashboard')}
+              onClick={() => navigate('/match-requests')}
               className="btn-primary text-white"
             >
-              Go to Dashboard
+              My Requests / Matches
             </Button>
           </CardContent>
         </Card>
@@ -212,10 +213,12 @@ const PaymentSuccess = () => {
         </Card>
       </div>
 
+      {paymentStatus.shipment_id && <div className="text-center"><Button onClick={() => navigate(`/shipment/${paymentStatus.shipment_id}`)}>Track shipment</Button></div>}
+
       {/* Action Buttons */}
       <div className="flex flex-col sm:flex-row gap-4 justify-center items-center">
         <Button 
-          onClick={() => navigate('/messages')}
+          onClick={() => paymentStatus.metadata?.match_id ? openMatchConversation(paymentStatus.metadata.match_id, navigate) : navigate('/match-requests')}
           className="w-full sm:w-auto btn-primary text-white px-8"
         >
           Message Traveler
@@ -224,10 +227,10 @@ const PaymentSuccess = () => {
         
         <Button 
           variant="outline"
-          onClick={() => navigate('/dashboard')}
+          onClick={() => navigate('/match-requests')}
           className="w-full sm:w-auto border-orange-200 text-orange-600 hover:bg-orange-50 px-8"
         >
-          Go to Dashboard
+          My Requests / Matches
         </Button>
         
         <Button 

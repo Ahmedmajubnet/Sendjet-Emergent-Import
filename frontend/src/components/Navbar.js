@@ -47,7 +47,7 @@ const Navbar = () => {
     ? [
         { path: '/dashboard', icon: Home, label: 'Dashboard' },
         { path: '/marketplace', icon: ShoppingCart, label: 'Marketplace' },
-        { path: '/match-requests', icon: Package, label: 'Requests' },
+        { path: '/match-requests', icon: Package, label: 'My Requests' },
         { path: '/direct-messages', icon: MessageCircle, label: 'Messages' },
         ...(user?.role === 'admin' ? [{ path: '/admin', icon: User, label: 'Admin' }] : []),
       ]

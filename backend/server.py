@@ -1060,7 +1060,16 @@ async def get_user_match_options(user_id: str, current_user: User = Depends(get_
         {"_id": 0, "id": 1, "origin": 1, "destination": 1, "departure_date": 1, "transport_mode": 1, "capacity_size": 1, "available_weight": 1, "visibility": 1}
     ).sort("departure_date", 1).to_list(50)
 
+    existing_matches = await db.matches.find({
+        "$or": [
+            {"sender_id": current_user.id, "traveler_id": user_id},
+            {"sender_id": user_id, "traveler_id": current_user.id},
+        ],
+        "status": {"$in": ["pending", "accepted", "payment_pending", "paid", "in_progress"]},
+    }, {"_id": 0}).sort("created_at", -1).to_list(1000)
+
     return {
+        "existing_matches": [Match(**m).dict() for m in existing_matches],
         "target_trips": target_trips,
         "target_shipments": target_shipments,
         "my_shipments": my_shipments,
@@ -1184,11 +1193,17 @@ async def start_direct_conversation(
     if conversation:
         return {"conversation_id": conversation["id"], "existing": True}
     
-    # Create new conversation
-    new_conversation = DirectConversation(participant_ids=participant_ids)
-    await db.direct_conversations.insert_one(new_conversation.dict())
-    
-    return {"conversation_id": new_conversation.id, "existing": False}
+    conversation_id = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(participant_ids)))
+    new_conversation = DirectConversation(id=conversation_id, participant_ids=participant_ids)
+    try:
+        result = await db.direct_conversations.update_one(
+            {"_id": f"direct:{conversation_id}"},
+            {"$setOnInsert": new_conversation.dict()}, upsert=True,
+        )
+        existing = result.upserted_id is None
+    except DuplicateKeyError:
+        existing = True
+    return {"conversation_id": conversation_id, "existing": existing}
 
 @api_router.get("/conversations/my")
 async def get_my_conversations(current_user: User = Depends(get_current_user)):
@@ -1437,17 +1452,47 @@ async def get_booking(match_id: str, current_user: User = Depends(get_current_us
     if current_user.id not in [match["sender_id"], match["traveler_id"]] and current_user.role != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    # Get shipment and user details
+    return await _match_details(match)
+
+
+async def _match_details(match):
     shipment = await db.shipments.find_one({"id": match["shipment_id"]}, {"_id": 0})
-    traveler = await db.users.find_one({"id": match["traveler_id"]}, {"_id": 0, "hashed_password": 0})
-    sender = await db.users.find_one({"id": match["sender_id"]}, {"_id": 0, "hashed_password": 0})
-    
+    trip = await db.trips.find_one({"id": match.get("trip_id")}, {"_id": 0}) if match.get("trip_id") else None
+    profile = {"_id": 0, "id": 1, "full_name": 1, "avatar": 1, "role": 1, "rating": 1, "total_reviews": 1, "is_verified": 1}
     return {
-        "match": match,
-        "shipment": shipment,
-        "traveler": traveler,
-        "sender": sender
+        "match": Match(**match).dict(),
+        "shipment": Shipment(**shipment).dict() if shipment else None,
+        "trip": Trip(**trip).dict() if trip else None,
+        "sender": await db.users.find_one({"id": match["sender_id"]}, profile),
+        "traveler": await db.users.find_one({"id": match["traveler_id"]}, profile),
     }
+
+
+@api_router.get("/matches/requests")
+async def get_match_requests(current_user: User = Depends(get_current_user)):
+    """Both directions and every lifecycle state, independent of listing availability."""
+    matches = await db.matches.find({"$or": [
+        {"sender_id": current_user.id}, {"traveler_id": current_user.id},
+    ]}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return [await _match_details(match) for match in matches]
+
+
+@api_router.post("/matches/{match_id}/conversation")
+async def open_match_conversation(match_id: str, current_user: User = Depends(get_current_user)):
+    match = await db.matches.find_one({"id": match_id}, {"_id": 0})
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+    if current_user.id not in {match["sender_id"], match["traveler_id"]}:
+        raise HTTPException(status_code=403, detail="Not your match")
+    if match.get("conversation_id"):
+        conversation = await db.direct_conversations.find_one({"id": match["conversation_id"]})
+        if conversation and set(conversation.get("participant_ids", [])) == {match["sender_id"], match["traveler_id"]}:
+            return {"conversation_id": conversation["id"], "existing": True}
+    other_id = match["traveler_id"] if current_user.id == match["sender_id"] else match["sender_id"]
+    result = await start_direct_conversation(other_id, current_user)
+    await db.matches.update_one({"id": match_id}, {"$set": {"conversation_id": result["conversation_id"]}})
+    return result
+
 
 @api_router.get("/shipments/{shipment_id}/chat-info")
 async def get_shipment_chat_info(
@@ -1456,13 +1501,17 @@ async def get_shipment_chat_info(
 ):
     # Verify access and get shipment data
     shipment = await verify_shipment_access(shipment_id, current_user)
-    match = await db.matches.find_one({"shipment_id": shipment_id})
+    match = await db.matches.find_one({
+        "shipment_id": shipment_id,
+        "status": {"$in": ["accepted", "payment_pending", "paid", "in_progress", "completed"]},
+        **({"id": shipment["assigned_match_id"]} if shipment.get("assigned_match_id") else {}),
+    }, {"_id": 0})
     
     # Get participants info
     participants = []
     
     # Add sender
-    sender = await db.users.find_one({"id": shipment["sender_id"]}, {"_id": 0})
+    sender = await db.users.find_one({"id": shipment["sender_id"]}, {"_id": 0, "id": 1, "full_name": 1, "avatar": 1})
     if sender:
         participants.append({
             "user_id": sender["id"],
@@ -1475,7 +1524,7 @@ async def get_shipment_chat_info(
     # Add traveler if matched
     traveler = None
     if match:
-        traveler = await db.users.find_one({"id": match["traveler_id"]}, {"_id": 0})
+        traveler = await db.users.find_one({"id": match["traveler_id"]}, {"_id": 0, "id": 1, "full_name": 1, "avatar": 1})
         if traveler:
             participants.append({
                 "user_id": traveler["id"],
@@ -1499,6 +1548,7 @@ async def get_shipment_chat_info(
         "participants": participants,
         "unread_count": unread_count,
         "match_status": match["status"] if match else None,
+        "payment_status": match.get("payment_status") if match else None,
         "sender": sender,
         "traveler": traveler
     }
@@ -2817,11 +2867,6 @@ async def create_match_request(match_data: dict, current_user: User = Depends(ge
         raise HTTPException(status_code=404, detail="Shipment not found")
     if not trip:
         raise HTTPException(status_code=404, detail="Journey not found")
-    if shipment.get("status") != "pending":
-        raise HTTPException(status_code=400, detail="This shipment is no longer available for matching")
-    if trip.get("status") != "active":
-        raise HTTPException(status_code=400, detail="This journey is no longer available for matching")
-
     sender_id = shipment["sender_id"]
     traveler_id = trip["traveler_id"]
     if sender_id == traveler_id:
@@ -2836,15 +2881,21 @@ async def create_match_request(match_data: dict, current_user: User = Depends(ge
         if not conversation or set(conversation.get("participant_ids", [])) != expected:
             raise HTTPException(status_code=400, detail="Conversation does not match these users")
 
-    existing = await db.matches.find_one({
-        "shipment_id": shipment_id,
-        "trip_id": trip_id,
-        "traveler_id": traveler_id,
-        "sender_id": sender_id,
-        "status": {"$in": ["pending", "accepted", "payment_pending", "paid", "in_progress"]}
-    }, {"_id": 0, "id": 1})
+    combination = {"shipment_id": shipment_id, "trip_id": trip_id,
+                   "sender_id": sender_id, "traveler_id": traveler_id}
+    existing = await db.matches.find_one({**combination,
+        "status": {"$in": ["pending", "accepted", "payment_pending", "paid", "in_progress"]},
+    }, {"_id": 0})
+    # Resolve an existing request before testing availability: acceptance reserves the shipment.
     if existing:
-        raise HTTPException(status_code=409, detail="A match request is already active for this shipment and journey")
+        return {"match": Match(**existing).dict(), "existing": True, "message": "Continue your existing match"}
+    if shipment.get("status") != "pending":
+        raise HTTPException(status_code=400, detail="This shipment is no longer available for matching")
+    if trip.get("status") != "active":
+        raise HTTPException(status_code=400, detail="This journey is no longer available for matching")
+    if not conversation_id:
+        conversation = await start_direct_conversation(other_user_id, current_user)
+        conversation_id = conversation["conversation_id"]
 
     commission_amount = price_offered * 0.1
     match = Match(
@@ -2860,7 +2911,21 @@ async def create_match_request(match_data: dict, current_user: User = Depends(ge
         traveler_payout_amount=price_offered - commission_amount,
         conversation_id=conversation_id
     )
-    await db.matches.insert_one(match.dict())
+    # Mongo's unique _id serializes simultaneous repeats without migrating legacy rows.
+    # A terminal request permits a new generation, preserving all previous requests.
+    generation = await db.matches.count_documents({**combination,
+        "status": {"$in": ["rejected", "cancelled", "completed"]}})
+    request_key = hashlib.sha256(json.dumps(combination, sort_keys=True).encode()).hexdigest()
+    record_id = f"request:{request_key}:{generation}"
+    try:
+        created = await db.matches.update_one({"_id": record_id},
+            {"$setOnInsert": match.dict()}, upsert=True)
+        inserted = created.upserted_id is not None
+    except DuplicateKeyError:
+        inserted = False
+    if not inserted:
+        existing = await db.matches.find_one({"_id": record_id}, {"_id": 0})
+        return {"match": Match(**existing).dict(), "existing": True, "message": "Continue your existing match"}
 
     if current_user.id == sender_id:
         title = "New Match Request"
@@ -2878,7 +2943,7 @@ async def create_match_request(match_data: dict, current_user: User = Depends(ge
         "shipment_id": shipment_id,
         "trip_id": trip_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "link": "/match-requests"
+        "link": f"/match-requests?match={match.id}"
     })
     if conversation_id:
         await direct_message_manager.send_to_users([sender_id, traveler_id], {
@@ -2886,7 +2951,7 @@ async def create_match_request(match_data: dict, current_user: User = Depends(ge
             "conversation_id": conversation_id,
             "reason": "match_request"
         })
-    return {"match": match.dict(), "message": "Match request sent successfully"}
+    return {"match": match.dict(), "existing": False, "message": "Match request sent successfully"}
 
 # Accept match request
 @api_router.put("/matches/{match_id}/accept")
@@ -2913,10 +2978,16 @@ async def accept_match_request(match_id: str, current_user: User = Depends(get_c
     )
     if not reserved.modified_count:
         raise HTTPException(status_code=409, detail="Shipment is no longer available for matching")
-    await db.matches.update_one(
+    accepted = await db.matches.update_one(
         {"id": match_id, "status": "pending"},
         {"$set": {"status": "accepted", "payment_status": "payment_pending"}},
     )
+    if not accepted.modified_count:
+        await db.shipments.update_one(
+            {"id": match["shipment_id"], "status": "matched", "assigned_match_id": match_id},
+            {"$set": {"status": "pending"}, "$unset": {"assigned_match_id": ""}},
+        )
+        raise HTTPException(status_code=409, detail="Match request already processed")
 
     # Determine who is who
     requester_id = match.get("requested_by", "")
@@ -2963,12 +3034,15 @@ async def reject_match_request(match_id: str, current_user: User = Depends(get_c
     if match.get("requested_by") == current_user.id:
         raise HTTPException(status_code=403, detail="Cannot reject your own request")
     
-    # Update match status
-    await db.matches.update_one(
-        {"id": match_id},
+    # A stale decline button must not reject an accepted or paid booking.
+    result = await db.matches.update_one(
+        {"id": match_id, "status": "pending"},
         {"$set": {"status": "rejected"}}
     )
     
+    if not result.modified_count:
+        raise HTTPException(status_code=409, detail="Only pending requests may be declined")
+
     # Notify requester
     requester_id = match.get("requested_by", "")
     if requester_id:

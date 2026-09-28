@@ -1,3 +1,4 @@
+import { shipmentStatusLabel } from '../lib/matchLifecycle';
 import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
@@ -393,7 +394,7 @@ const ShipmentChat = () => {
                       'bg-gray-100 text-gray-800'
                     }`}
                   >
-                    {chatInfo.shipment_status}
+                    {shipmentStatusLabel({ status: chatInfo.shipment_status }, chatInfo.match_status ? { status: chatInfo.match_status, payment_status: chatInfo.payment_status } : null)}
                   </Badge>
                   {chatInfo.match_status && (
                     <Badge variant="outline">

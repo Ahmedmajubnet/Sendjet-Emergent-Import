@@ -17,6 +17,8 @@ import {
 import { toast } from 'sonner';
 import axios from 'axios';
 import { BackButton } from './BackButton';
+import { matchActions, matchPath, matchStatusLabel } from '../lib/matchLifecycle';
+import { openMatchConversation } from '../lib/messaging';
 
 const BookingPayment = () => {
   const { matchId } = useParams();
@@ -43,6 +45,7 @@ const BookingPayment = () => {
   };
 
   const handlePayment = async () => {
+    if (paying || !booking || !matchActions(booking.match, user?.id).canPay) return;
     setPaying(true);
     try {
       const response = await axios.post('/payments/checkout', {
@@ -98,13 +101,13 @@ const BookingPayment = () => {
     );
   }
 
-  const { match, shipment, traveler, sender } = booking;
-  const isSender = user?.id === match?.sender_id;
+  const { match, shipment, traveler } = booking;
+  const actions = matchActions(match, user?.id);
   const commission = match.platform_commission_amount || (match.price_agreed * 0.1);
   const travelerPayout = match.traveler_payout_amount || (match.price_agreed - commission);
 
   // If already paid, show status
-  if (match.payment_status === 'escrowed' || match.status === 'paid') {
+  if (actions.canTrack) {
     return (
       <div className="max-w-2xl mx-auto px-3 sm:px-6 py-4 sm:py-6">
         <Card className="shadow-lg">
@@ -114,15 +117,14 @@ const BookingPayment = () => {
             </div>
             <h2 className="text-2xl font-bold mb-2 text-green-700">Payment Complete</h2>
             <p className="text-gray-600 mb-4">
-              ${match.price_agreed} is held securely in escrow. It will be released to the traveler upon delivery confirmation.
+              {matchStatusLabel(match, user?.id)}. Open tracking to continue this shipment.
             </p>
             <div className="flex gap-3 justify-center">
-              <Button onClick={() => navigate(`/shipment/${shipment.id}`)} className="btn-primary text-white">
+              <Button onClick={() => navigate(`/shipment/${match.shipment_id}`)} className="btn-primary text-white">
                 Track Shipment
               </Button>
-              <Button variant="outline" onClick={() => navigate('/dashboard')}>
-                Dashboard
-              </Button>
+              <Button variant="outline" onClick={() => navigate(matchPath(match.id))}>Open request</Button>
+              <Button variant="outline" onClick={() => openMatchConversation(match.id, navigate)}>Message</Button>
             </div>
           </CardContent>
         </Card>
@@ -133,11 +135,16 @@ const BookingPayment = () => {
   return (
     <div className="max-w-3xl mx-auto px-3 sm:px-6 py-4 sm:py-6 space-y-5 sm:space-y-6" data-testid="booking-payment-page">
       {/* Back button */}
-      <BackButton fallback="/dashboard" />
+      <BackButton fallback={matchPath(match.id)} />
+
+      <div className="flex flex-wrap gap-2">
+        <Button variant="outline" onClick={() => navigate(matchPath(match.id))}>Open request</Button>
+        <Button variant="outline" onClick={() => openMatchConversation(match.id, navigate)}>Message</Button>
+      </div>
 
       {/* Header */}
       <div className="text-center space-y-2">
-        <h1 className="text-2xl font-bold text-gray-800">Complete Payment</h1>
+        <h1 className="text-2xl font-bold text-gray-800">{matchStatusLabel(match, user?.id)}</h1>
         <p className="text-gray-600">Secure your delivery with escrow protection</p>
       </div>
 
@@ -229,7 +236,7 @@ const BookingPayment = () => {
             </div>
 
             {/* Pay Button */}
-            {isSender && (
+            {actions.canPay && (
               <Button
                 onClick={handlePayment}
                 disabled={paying}
@@ -250,10 +257,10 @@ const BookingPayment = () => {
               </Button>
             )}
 
-            {!isSender && (
+            {!actions.canPay && (
               <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-center">
                 <p className="text-sm text-yellow-800">
-                  Waiting for the sender to complete payment.
+                  {matchStatusLabel(match, user?.id)}
                 </p>
               </div>
             )}

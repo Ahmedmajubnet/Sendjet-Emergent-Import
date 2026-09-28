@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Badge } from './ui/badge';
@@ -16,9 +16,12 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import axios from 'axios';
+import { matchActions, matchPath, shipmentMatch, shipmentStatusLabel } from '../lib/matchLifecycle';
 
 const ShipmentTracking = () => {
   const { shipmentId } = useParams();
+  const navigate = useNavigate();
+  const [lifecycleMatch, setLifecycleMatch] = useState(null);
   const { user } = useAuth();
   const [shipment, setShipment] = useState(null);
   const [pickupCode, setPickupCode] = useState('');
@@ -52,6 +55,7 @@ const ShipmentTracking = () => {
         axios.get('/matches/my'),
       ]);
       setShipment(shipmentResponse.data);
+      setLifecycleMatch(shipmentMatch(matchesResponse.data, shipmentId));
       const paidMatches = matchesResponse.data.filter((match) =>
         match.shipment_id === shipmentId && match.payment_status === 'escrowed' &&
         ['paid', 'in_progress'].includes(match.status)
@@ -165,7 +169,7 @@ const ShipmentTracking = () => {
   const getStatusLabel = (status) => {
     const labels = {
       pending: 'Pending',
-      matched: 'Matched with Traveler',
+      matched: 'Traveler assigned',
       picked_up: 'Package Picked Up',
       in_transit: 'In Transit',
       arrived: 'Arrived at Destination',
@@ -211,9 +215,16 @@ const ShipmentTracking = () => {
           <p className="text-gray-600 mt-1">Track your package in real-time</p>
         </div>
         <Badge className={`${getStatusColor(currentStatus)} text-sm px-4 py-2`}>
-          {getStatusLabel(currentStatus)}
+          {shipmentStatusLabel(shipment, lifecycleMatch)}
         </Badge>
       </div>
+
+      {lifecycleMatch && !matchActions(lifecycleMatch, user?.id).canTrack && (
+        <Card><CardContent className="p-5 space-y-3">
+          <p>{shipmentStatusLabel(shipment, lifecycleMatch)}. Payment and secure pickup confirmation are still required before transport.</p>
+          <Button onClick={() => navigate(matchPath(lifecycleMatch.id))}>Open request / payment and messages</Button>
+        </CardContent></Card>
+      )}
 
       {/* Shipment Overview */}
       <Card>

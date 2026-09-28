@@ -19,3 +19,13 @@ export const openConversationWith = async (recipientId, navigate, { replace = fa
     }
   }
 };
+
+// Match chat is a private participant conversation, available before payment.
+export const openMatchConversation = async (matchId, navigate) => {
+  try {
+    const response = await axios.post(`/matches/${matchId}/conversation`);
+    navigate(`/direct-messages/${response.data.conversation_id}`);
+  } catch (error) {
+    toast.error(error.response?.data?.detail || 'Failed to open match conversation');
+  }
+};

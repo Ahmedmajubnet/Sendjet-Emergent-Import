@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
+import { useNavigate } from 'react-router-dom';
+import { matchPath, matchStatusLabel, relevantMatches } from '../lib/matchLifecycle';
 import { toast } from 'sonner';
 import { Handshake, Package, Route, Loader2, Plus, Plane, Car, Train, Bus, Eye, EyeOff } from 'lucide-react';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './ui/dialog';
@@ -39,6 +41,8 @@ const MatchRequestDialog = ({
   preferredShipmentId = null,
   initialMode = null,
 }) => {
+  const navigate = useNavigate();
+  const [existingMatches, setExistingMatches] = useState([]);
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [creating, setCreating] = useState(null);
@@ -60,6 +64,13 @@ const MatchRequestDialog = ({
     try {
       const res = await axios.get(`/users/${targetUserId}/match-options`);
       const data = res.data || {};
+      const existing = relevantMatches(data.existing_matches || [], preferredTripId, preferredShipmentId);
+      setExistingMatches(existing);
+      if (existing.length === 1) {
+        onOpenChange(false);
+        navigate(matchPath(existing[0].id));
+        return;
+      }
       const next = {
         target_trips: data.target_trips || [],
         target_shipments: data.target_shipments || [],
@@ -210,8 +221,9 @@ const MatchRequestDialog = ({
     try {
       const payload = { trip_id: tripId, shipment_id: shipmentId, price_offered: numericPrice };
       if (conversationId) payload.conversation_id = conversationId;
-      await axios.post('/matches/request', payload);
-      toast.success('Match request sent');
+      const response = await axios.post('/matches/request', payload);
+      toast.success(response.data.existing ? 'Opening your existing request' : 'Match request sent');
+      navigate(matchPath(response.data.match.id));
       onOpenChange(false);
       setPrice('');
     } catch (error) {
@@ -240,6 +252,15 @@ const MatchRequestDialog = ({
 
         {loading ? (
           <div className="py-10 flex justify-center"><Loader2 className="h-7 w-7 animate-spin text-orange-500" /></div>
+        ) : existingMatches.length > 0 ? (
+          <div className="space-y-3">
+            <p>Your existing requests with {targetUserName || 'this user'}:</p>
+            {existingMatches.map((match) => (
+              <Button key={match.id} variant="outline" className="w-full" onClick={() => { onOpenChange(false); navigate(matchPath(match.id)); }}>
+                Open request #{match.id.slice(0, 8)} · {matchStatusLabel(match)}
+              </Button>
+            ))}
+          </div>
         ) : !canSend && !canCarry ? (
           <div className="rounded-xl border border-dashed p-5 text-center space-y-2">
             <Handshake className="h-9 w-9 mx-auto text-gray-300" />
