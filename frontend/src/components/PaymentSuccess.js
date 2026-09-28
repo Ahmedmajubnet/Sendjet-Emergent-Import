@@ -1,8 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
 import { Button } from './ui/button';
-import { CheckCircle, ArrowRight, Download, Star } from 'lucide-react';
+import { CheckCircle, ArrowRight, Download, Loader2, Star } from 'lucide-react';
 import { toast } from 'sonner';
 import axios from 'axios';
 import { openMatchConversation } from '../lib/messaging';
@@ -12,6 +12,9 @@ const PaymentSuccess = () => {
   const [searchParams] = useSearchParams();
   const [paymentStatus, setPaymentStatus] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [receiptLoading, setReceiptLoading] = useState(false);
+  const [receiptUrl, setReceiptUrl] = useState(null);
+  const receiptRunning = useRef(false);
   const sessionId = searchParams.get('session_id');
 
   useEffect(() => {
@@ -54,6 +57,41 @@ const PaymentSuccess = () => {
         toast.error('Failed to verify payment status');
         setLoading(false);
       }
+    }
+  };
+
+  const openReceipt = async () => {
+    if (receiptRunning.current || paymentStatus?.payment_status !== 'paid') return;
+    receiptRunning.current = true;
+    setReceiptLoading(true);
+    setReceiptUrl(null);
+    let receiptWindow = null;
+    try {
+      // Open during the click gesture, before the authenticated request awaits.
+      // Detach the opener before navigating to the external hosted receipt.
+      receiptWindow = window.open('about:blank', '_blank');
+      if (receiptWindow) receiptWindow.opener = null;
+      const result = await axios.get(`/payments/receipt/${encodeURIComponent(sessionId)}`);
+      const url = new URL(result.data.receipt_url);
+      if (url.protocol !== 'https:' || url.hostname !== 'pay.stripe.com' ||
+          url.username || url.password || (url.port && url.port !== '443') || !url.pathname.startsWith('/receipts/')) {
+        throw new Error('Invalid receipt link');
+      }
+      setReceiptUrl(url.href);
+      if (receiptWindow && !receiptWindow.closed) {
+        receiptWindow.location.replace(url.href);
+      } else {
+        toast.info('Use Open Stripe receipt below to open your receipt.');
+      }
+    } catch (error) {
+      if (receiptWindow && !receiptWindow.closed) receiptWindow.close();
+      const status = error.response?.status;
+      const message = status === 401 ? 'Please sign in again to view your receipt.' :
+        error.response?.data?.detail || 'Could not open your Stripe receipt. Please try again.';
+      toast.error(message);
+    } finally {
+      receiptRunning.current = false;
+      setReceiptLoading(false);
     }
   };
 
@@ -235,12 +273,18 @@ const PaymentSuccess = () => {
         
         <Button 
           variant="outline"
+          onClick={openReceipt}
+          disabled={receiptLoading || paymentStatus.payment_status !== 'paid'}
+          aria-busy={receiptLoading}
           className="w-full sm:w-auto border-gray-200 text-gray-600 hover:bg-gray-50"
         >
-          <Download className="h-4 w-4 mr-2" />
+          {receiptLoading ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Download className="h-4 w-4 mr-2" />}
           Download Receipt
         </Button>
       </div>
+
+      {receiptUrl && <p className="text-center"><a href={receiptUrl} target="_blank" rel="noopener noreferrer" className="text-orange-600 underline">Open Stripe receipt</a></p>}
+      {paymentStatus.payment_status !== 'paid' && <p className="text-center text-sm text-gray-600">A receipt is available only after payment is completed.</p>}
 
       {/* Rating Prompt */}
       <Card className="bg-gradient-to-r from-yellow-50 to-orange-50 border-yellow-200">

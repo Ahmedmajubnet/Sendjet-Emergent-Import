@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request, Response, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 import json
 import base64
 import re
+from urllib.parse import urlsplit
 from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
 import httpx
 
@@ -3308,6 +3309,84 @@ async def get_payment_status(
         "metadata": checkout_status.metadata,
         **confirmation_status,
     }
+
+
+async def _stripe_receipt_object(path: str, expand: Optional[str] = None):
+    """Read only the Stripe objects needed for a receipt; never log provider data."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            result = await http.get(
+                f"https://api.stripe.com/v1/{path}",
+                headers={"Authorization": f"Bearer {stripe_api_key}", "Stripe-Version": "2024-06-20"},
+                params={"expand[]": expand} if expand else None,
+            )
+            result.raise_for_status()
+            data = result.json()
+        if not isinstance(data, dict) or data.get("id") != path.rsplit("/", 1)[-1]:
+            raise ValueError("Invalid Stripe response")
+        return data
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(status_code=502, detail="Could not retrieve the Stripe receipt. Please try again.") from None
+
+
+@api_router.get("/payments/receipt/{session_id}")
+async def get_payment_receipt(
+    session_id: str,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+):
+    """Resolve a fresh hosted receipt for the paying sender or an administrator."""
+    response.headers["Cache-Control"] = "no-store"
+    if not re.fullmatch(r"cs_[A-Za-z0-9_]+", session_id):
+        raise HTTPException(status_code=400, detail="Invalid Checkout Session ID")
+    transaction = await db.payment_transactions.find_one(
+        {"session_id": session_id}, {"_id": 0, "sender_id": 1},
+    )
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Payment transaction not found")
+    # Payment-status visibility for travelers does not grant access to payer receipts.
+    if current_user.id != transaction.get("sender_id") and current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Only the paying sender or an admin can access this receipt")
+    _ensure_payments_enabled()
+
+    session = await _stripe_receipt_object(f"checkout/sessions/{session_id}", "payment_intent.latest_charge")
+    if session.get("id") != session_id:
+        raise HTTPException(status_code=502, detail="Could not verify the Stripe payment receipt")
+    if session.get("status") != "complete" or session.get("payment_status") != "paid":
+        raise HTTPException(status_code=409, detail="A receipt is available only after payment is completed")
+
+    # The stored match.payment_intent_id is historically a cs_ ID. Follow Stripe's
+    # actual relationship instead; support expanded objects and ID-only responses.
+    intent = session.get("payment_intent")
+    if isinstance(intent, str) and re.fullmatch(r"pi_[A-Za-z0-9]+", intent):
+        intent = await _stripe_receipt_object(f"payment_intents/{intent}", "latest_charge")
+    if not isinstance(intent, dict):
+        raise HTTPException(status_code=404, detail="Stripe has not made a receipt available for this payment yet")
+    if intent.get("status") != "succeeded":
+        raise HTTPException(status_code=409, detail="A receipt is available only after payment is completed")
+    charge = intent.get("latest_charge")
+    if isinstance(charge, str) and re.fullmatch(r"ch_[A-Za-z0-9]+", charge):
+        charge = await _stripe_receipt_object(f"charges/{charge}")
+    if not isinstance(charge, dict):
+        raise HTTPException(status_code=404, detail="Stripe has not made a receipt available for this payment yet")
+    if not intent.get("id") or charge.get("payment_intent") != intent["id"]:
+        raise HTTPException(status_code=502, detail="Could not verify the Stripe payment receipt")
+    if charge.get("paid") is not True or charge.get("status") != "succeeded":
+        raise HTTPException(status_code=409, detail="A receipt is available only after payment is completed")
+    receipt_url = charge.get("receipt_url")
+    if not receipt_url:
+        raise HTTPException(status_code=404, detail="Stripe has not made a receipt available for this payment yet")
+    try:
+        url = urlsplit(receipt_url)
+        valid_url = (url.scheme == "https" and url.hostname == "pay.stripe.com"
+                     and url.port in (None, 443) and not url.username and not url.password
+                     and url.path.startswith("/receipts/"))
+    except (TypeError, ValueError, AttributeError):
+        valid_url = False
+    if not valid_url:
+        raise HTTPException(status_code=502, detail="Stripe returned an invalid receipt link. Please try again.")
+    # Do not persist an expiring URL or return the underlying Stripe objects.
+    return {"receipt_url": receipt_url}
 
 
 @api_router.post("/webhook/stripe")
