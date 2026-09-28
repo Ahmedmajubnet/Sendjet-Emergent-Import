@@ -1,0 +1,18 @@
+User-agent: *
+Allow: /
+
+# Non-public / user-scoped routes
+Disallow: /dashboard
+Disallow: /admin
+Disallow: /messages
+Disallow: /direct-messages
+Disallow: /match-requests
+Disallow: /booking/
+Disallow: /payment-success
+Disallow: /payment-cancelled
+Disallow: /create-trip
+Disallow: /create-shipment
+Disallow: /api/
+
+# Sitemap
+Sitemap: https://sendjet.de/api/sitemap.xml

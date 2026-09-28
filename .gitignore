@@ -1,0 +1,32 @@
+# Dependencies, generated output and caches
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+frontend/build/
+build/
+dist/
+coverage/
+*.log
+*.tmp
+*.bak
+# Private environment and credentials
+.env
+.env.*
+!.env.example
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
+# Local tooling, preview artifacts and reports
+.gitconfig
+.emergent/
+.agents/
+.codex/
+.idea/
+.vscode/
+.DS_Store
+memory/
+test_reports/

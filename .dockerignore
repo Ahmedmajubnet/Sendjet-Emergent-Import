@@ -1,0 +1,10 @@
+node_modules/
+__pycache__/
+*.pyc
+.git/
+.env
+memory/test_credentials.md
+test_reports/
+*.log
+.DS_Store
+yarn.lock

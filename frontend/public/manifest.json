@@ -1,0 +1,42 @@
+{
+  "name": "SendJet",
+  "short_name": "SendJet",
+  "description": "Smart marketplace connecting travelers with senders",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#FF6B00",
+  "background_color": "#FFFFFF",
+  "lang": "en",
+  "dir": "ltr",
+  "categories": ["business", "travel", "shopping", "lifestyle"],
+  "icons": [
+    { "src": "/icons/icon-48.png",  "sizes": "48x48",   "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-72.png",  "sizes": "72x72",   "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-96.png",  "sizes": "96x96",   "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-128.png", "sizes": "128x128", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-144.png", "sizes": "144x144", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-152.png", "sizes": "152x152", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-180.png", "sizes": "180x180", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-256.png", "sizes": "256x256", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-384.png", "sizes": "384x384", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+
+    { "src": "/icons/maskable-48.png",  "sizes": "48x48",   "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/maskable-72.png",  "sizes": "72x72",   "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/maskable-96.png",  "sizes": "96x96",   "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/maskable-144.png", "sizes": "144x144", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/maskable-256.png", "sizes": "256x256", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/maskable-384.png", "sizes": "384x384", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Marketplace",   "short_name": "Marketplace",   "description": "Browse trips and shipments",   "url": "/marketplace", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Post a Trip",   "short_name": "Trip",          "description": "Share your luggage space",     "url": "/create-trip",  "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Send a Parcel", "short_name": "Send",          "description": "Post a shipment request",      "url": "/create-shipment", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] }
+  ],
+  "prefer_related_applications": false
+}
