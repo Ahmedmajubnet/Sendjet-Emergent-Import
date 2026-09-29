@@ -46,7 +46,7 @@ _log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 def _public_site_url() -> str:
     """Base public URL used to construct action links inside emails."""
-    return os.environ.get("PUBLIC_SITE_URL", "https://sendjet.de").rstrip("/")
+    return os.environ.get("PUBLIC_SITE_URL", "http://localhost:3000").strip().rstrip("/")
 
 
 def _sender() -> str:

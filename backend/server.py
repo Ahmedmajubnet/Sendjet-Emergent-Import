@@ -19,7 +19,9 @@ import json
 import base64
 import re
 from urllib.parse import urlsplit
-from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+from config import load_settings
+from services.demo import seed_demo_data, refresh_demo_listings
+from services.payments import StripeGateway, checkout_for_match, verify_webhook, validate_payment_session
 import httpx
 
 # Email subsystem (provider-agnostic, Resend by default; falls back to no-op
@@ -29,6 +31,7 @@ from services.email import tokens as email_tokens
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+settings = load_settings()  # Validate before constructing any database client.
 
 EMERGENT_AUTH_SESSION_URL = os.environ.get(
     "EMERGENT_AUTH_SESSION_URL",
@@ -43,9 +46,7 @@ db = client[os.environ['DB_NAME']]
 # Security setup
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
-SECRET_KEY = os.environ.get('SECRET_KEY', '')
-if not SECRET_KEY:
-    raise RuntimeError("Set SECRET_KEY in your private runtime environment before starting SendJet")
+SECRET_KEY = settings.secret_key
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -58,21 +59,17 @@ def hash_confirmation_code(code: str) -> str:
         f"{SECRET_KEY}:{code}".encode("utf-8")
     ).hexdigest()
 
-# Stripe setup - Use SENDJET_STRIPE_KEY first, fallback to STRIPE_API_KEY
-stripe_api_key = os.environ.get('SENDJET_STRIPE_KEY') or os.environ.get('STRIPE_API_KEY')
-
-# Preview/test safety guard: payments are only enabled when a Stripe key is present.
-# In this preview environment the key is intentionally unset so no live (or test)
-# charge can ever be created. This also prevents the endpoints from crashing on a
-# missing key.
+# One validated configuration path for every Stripe operation.
+stripe_api_key = settings.stripe_key
 PAYMENTS_ENABLED = bool(stripe_api_key)
+stripe_gateway = StripeGateway(stripe_api_key, settings.stripe_live)
 
 
 def _ensure_payments_enabled():
     if not stripe_api_key:
         raise HTTPException(
             status_code=503,
-            detail="Payments are disabled in this test/preview environment (no Stripe test key configured).",
+            detail="Payments are unavailable: no Stripe key configured.",
         )
 
 app = FastAPI(title="SendJet API", version="1.0.0")
@@ -2089,88 +2086,22 @@ async def get_my_matches(current_user: User = Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 # Self-healing demo listings
 # ---------------------------------------------------------------------------
-# The marketplace must never look empty. When a seeded demo trip / shipment
-# expires (its departure_date / pickup_date is now in the past), we roll it
-# forward to a random near-future date instead of letting it silently vanish.
-#
-# Triggered lazily by GET /api/trips and GET /api/shipments, throttled to run
-# at most once per _DEMO_REFRESH_INTERVAL so it's virtually free.
-# Only touches listings owned by @demo.sendjet.com users — real listings from
-# real users are never modified.
+# Keep unbooked, explicitly marked demo listings available. Throttle scans on
+# marketplace reads; each write independently protects the marker and state.
 # ---------------------------------------------------------------------------
-import random as _random
 _LAST_DEMO_REFRESH: Optional[datetime] = None
 _DEMO_REFRESH_INTERVAL = timedelta(minutes=5)
-_DEMO_EMAIL_PATTERN = "@demo.sendjet.com"
 
 
 async def _refresh_demo_listings_if_needed() -> None:
-    """Roll expired demo listings forward. Safe to call on every request."""
     global _LAST_DEMO_REFRESH
     now = datetime.now(timezone.utc)
-    if _LAST_DEMO_REFRESH is not None and (now - _LAST_DEMO_REFRESH) < _DEMO_REFRESH_INTERVAL:
-        return  # throttled
-    _LAST_DEMO_REFRESH = now
-
-    # Gather demo user ids (a couple dozen at most).
-    demo_user_ids: list[str] = []
-    async for u in db.users.find(
-        {"email": {"$regex": _DEMO_EMAIL_PATTERN}},
-        {"_id": 0, "id": 1}
-    ):
-        demo_user_ids.append(u["id"])
-    if not demo_user_ids:
+    if not settings.enable_demo_data:
         return
-
-    trips_rolled = 0
-    async for t in db.trips.find(
-        {
-            "traveler_id": {"$in": demo_user_ids},
-            "$or": [
-                {"status": "expired"},
-                {"departure_date": {"$lt": now}},
-            ],
-        },
-        {"_id": 0, "id": 1},
-    ):
-        new_departure = now + timedelta(days=_random.randint(3, 30))
-        await db.trips.update_one(
-            {"id": t["id"]},
-            {"$set": {
-                "departure_date": new_departure,
-                "status": "active",
-                "updated_at": now,
-            }},
-        )
-        trips_rolled += 1
-
-    ships_rolled = 0
-    async for s in db.shipments.find(
-        {
-            "sender_id": {"$in": demo_user_ids},
-            "status": {"$in": ["pending", "expired"]},
-            "$or": [
-                {"status": "expired"},
-                {"pickup_date": {"$lt": now}},
-            ],
-        },
-        {"_id": 0, "id": 1},
-    ):
-        new_pickup = now + timedelta(days=_random.randint(2, 21))
-        await db.shipments.update_one(
-            {"id": s["id"], "status": {"$in": ["pending", "expired"]}},
-            {"$set": {
-                "pickup_date": new_pickup,
-                "status": "pending",
-                "updated_at": now,
-            }},
-        )
-        ships_rolled += 1
-
-    if trips_rolled or ships_rolled:
-        logger.info(
-            f"Demo self-heal: rolled forward {trips_rolled} trips + {ships_rolled} shipments"
-        )
+    if _LAST_DEMO_REFRESH is not None and now - _LAST_DEMO_REFRESH < _DEMO_REFRESH_INTERVAL:
+        return
+    await refresh_demo_listings(db)
+    _LAST_DEMO_REFRESH = now
 
 
 async def _hidden_owner_ids() -> list[str]:
@@ -3114,10 +3045,8 @@ async def create_payment_checkout(
     """Create Stripe checkout session for a match payment"""
     _ensure_payments_enabled()
     match_id = checkout_data.get("match_id")
-    origin_url = checkout_data.get("origin_url")
-    
-    if not match_id or not origin_url:
-        raise HTTPException(status_code=400, detail="match_id and origin_url required")
+    if not isinstance(match_id, str) or not match_id:
+        raise HTTPException(status_code=400, detail="match_id required")
     
     # Get match details
     match = await db.matches.find_one({"id": match_id}, {"_id": 0})
@@ -3140,67 +3069,11 @@ async def create_payment_checkout(
     if not private_details or not private_details.get("recipient_name") or not private_details.get("recipient_email"):
         raise HTTPException(status_code=400, detail="Recipient name and email must be provided before payment; recreate this shipment with recipient details")
 
-    # Get amount from match (server-side, never from frontend)
-    amount = float(match["price_agreed"])
-    
-    # Build URLs
-    success_url = f"{origin_url}/payment-success?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"{origin_url}/payment-cancelled"
-    
-    # Initialize Stripe
-    host_url = str(request.base_url)
-    webhook_url = f"{host_url}api/webhook/stripe"
-    
-    try:
-        stripe_checkout = StripeCheckout(api_key=stripe_api_key, webhook_url=webhook_url)
+    async def reconcile(transaction):
+        await _complete_paid_payment(transaction, request)
 
-        # Create checkout session
-        checkout_request = CheckoutSessionRequest(
-            amount=amount,
-            currency="usd",
-            success_url=success_url,
-            cancel_url=cancel_url,
-            metadata={
-                "match_id": match_id,
-                "sender_id": current_user.id,
-                "traveler_id": match["traveler_id"],
-                "shipment_id": match["shipment_id"]
-            }
-        )
-
-        session = await stripe_checkout.create_checkout_session(checkout_request)
-
-        # Store payment transaction (only if checkout session was successfully created)
-        transaction = {
-            "id": str(uuid.uuid4()),
-            "session_id": session.session_id,
-            "match_id": match_id,
-            "sender_id": current_user.id,
-            "traveler_id": match["traveler_id"],
-            "shipment_id": match["shipment_id"],
-            "amount": amount,
-            "currency": "usd",
-            "payment_status": "initiated",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "metadata": {
-                "match_id": match_id,
-                "sender_id": current_user.id
-            }
-        }
-        await db.payment_transactions.insert_one(transaction)
-
-        # Update match with session info
-        await db.matches.update_one(
-            {"id": match_id},
-            {"$set": {"status": "payment_pending", "payment_intent_id": session.session_id}}
-        )
-
-        return {"url": session.url, "session_id": session.session_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Stripe checkout error for match {match_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Payment service error: {str(e)}")
+    # The client cannot choose redirect hosts. All workers share durable attempts.
+    return await checkout_for_match(db, match, stripe_gateway, settings.public_site_url, reconcile)
 
 
 async def _complete_paid_payment(transaction, request):
@@ -3283,18 +3156,14 @@ async def get_payment_status(
     if current_user.id not in [transaction["sender_id"], transaction["traveler_id"]]:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    # Check with Stripe
-    host_url = str(request.base_url)
-    webhook_url = f"{host_url}api/webhook/stripe"
-    stripe_checkout = StripeCheckout(api_key=stripe_api_key, webhook_url=webhook_url)
-    
-    checkout_status = await stripe_checkout.get_checkout_status(session_id)
-    
-    new_payment_status = checkout_status.payment_status
+    checkout_status = await stripe_gateway.retrieve(session_id)
+    validate_payment_session(checkout_status, transaction)
+
+    new_payment_status = checkout_status["payment_status"]
     # A paid webhook may precede this poll; reconciliation must still run.
     await db.payment_transactions.update_one(
         {"session_id": session_id, "payment_status": {"$ne": "paid"}},
-        {"$set": {"payment_status": new_payment_status, "status": checkout_status.status,
+        {"$set": {"payment_status": new_payment_status, "status": checkout_status["status"],
                   "updated_at": datetime.now(timezone.utc).isoformat()}},
     )
     confirmation_status = {}
@@ -3302,11 +3171,11 @@ async def get_payment_status(
         confirmation_status = await _complete_paid_payment(transaction, request)
 
     return {
-        "status": checkout_status.status,
-        "payment_status": checkout_status.payment_status,
-        "amount_total": checkout_status.amount_total,
-        "currency": checkout_status.currency,
-        "metadata": checkout_status.metadata,
+        "status": checkout_status["status"],
+        "payment_status": checkout_status["payment_status"],
+        "amount_total": checkout_status["amount_total"],
+        "currency": checkout_status["currency"],
+        "metadata": checkout_status["metadata"],
         **confirmation_status,
     }
 
@@ -3391,40 +3260,30 @@ async def get_payment_receipt(
 
 @api_router.post("/webhook/stripe")
 async def stripe_webhook(request: Request):
-    """Handle Stripe webhook events"""
+    """Verify raw bytes before inspecting the event or touching the database."""
     _ensure_payments_enabled()
-    body = await request.body()
-    signature = request.headers.get("Stripe-Signature")
-    
-    try:
-        host_url = str(request.base_url)
-        webhook_url = f"{host_url}api/webhook/stripe"
-        stripe_checkout = StripeCheckout(api_key=stripe_api_key, webhook_url=webhook_url)
-        
-        webhook_response = await stripe_checkout.handle_webhook(body, signature)
-        
-        # Update payment transaction
-        if webhook_response.session_id:
-            await db.payment_transactions.update_one(
-                {"session_id": webhook_response.session_id, "payment_status": {"$ne": "paid"}},
-                {"$set": {
-                    "payment_status": webhook_response.payment_status,
-                    "event_type": webhook_response.event_type,
-                    "updated_at": datetime.now(timezone.utc).isoformat()
-                }}
-            )
-        
-            if webhook_response.payment_status == "paid":
-                transaction = await db.payment_transactions.find_one({"session_id": webhook_response.session_id}, {"_id": 0})
-                if transaction:
-                    await _complete_paid_payment(transaction, request)
-
+    event = verify_webhook(await request.body(), request.headers.get("Stripe-Signature"),
+                           settings.webhook_secret, settings.stripe_live)
+    if event.get("type") not in {"checkout.session.completed", "checkout.session.async_payment_succeeded", "checkout.session.expired", "checkout.session.async_payment_failed"}:
         return {"status": "ok"}
-    except HTTPException:
-        raise
-    except Exception:
-        logger.error("Stripe webhook processing failed")
-        raise HTTPException(status_code=500, detail="Webhook processing failed; retry required")
+    session_id = event.get("data", {}).get("object", {}).get("id")
+    transaction = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+    if not transaction:
+        # Creation may have reached Stripe before its DB write. Retry the event
+        # rather than silently losing a legitimate payment on this account.
+        if event.get("data", {}).get("object", {}).get("metadata", {}).get("match_id"):
+            raise HTTPException(503, "Payment record not yet available; retry required")
+        return {"status": "ok"}
+    session = await stripe_gateway.retrieve(session_id)
+    validate_payment_session(session, transaction)
+    await db.payment_transactions.update_one(
+        {"session_id": session_id, "payment_status": {"$ne": "paid"}},
+        {"$set": {"payment_status": session["payment_status"], "event_type": event["type"],
+                  "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    if session["payment_status"] == "paid":
+        await _complete_paid_payment(transaction, request)
+    return {"status": "ok"}
 
 
 # Include router
@@ -3450,7 +3309,7 @@ async def sitemap():
     """
     from fastapi.responses import Response
     
-    base = os.environ.get("PUBLIC_SITE_URL", "https://sendjet.de").rstrip("/")
+    base = settings.public_site_url
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     
     urls = [
@@ -3497,7 +3356,7 @@ async def sitemap():
 # Note: When allow_origins=["*"], browsers REJECT responses with allow_credentials=True
 # (spec violation). This app uses JWT in the Authorization header — no cookies — so we
 # only enable credentials when explicit origins are configured.
-_cors_origins = [o.strip() for o in os.environ.get('CORS_ORIGINS', '*').split(',') if o.strip()]
+_cors_origins = list(settings.cors_origins)
 _allow_credentials = not (len(_cors_origins) == 1 and _cors_origins[0] == '*')
 app.add_middleware(
     CORSMiddleware,
@@ -3512,274 +3371,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 @app.on_event("startup")
-async def cleanup_expired_listings():
-    """Mark expired trips and shipments on startup"""
-    now = datetime.now(timezone.utc)
-
-    # Older real-time notifications were stored as ISO strings. Normalize them to
-    # timezone-aware UTC datetimes so history sorting and local-time rendering stay correct.
-    async for notif in db.notifications.find({"created_at": {"$type": "string"}}, {"_id": 1, "created_at": 1}):
-        raw = notif.get("created_at")
-        try:
-            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            await db.notifications.update_one({"_id": notif["_id"]}, {"$set": {"created_at": parsed}})
-        except (ValueError, TypeError):
-            pass
-    
-    expired_trips = await db.trips.update_many(
-        {"status": "active", "departure_date": {"$lt": now}},
-        {"$set": {"status": "expired"}}
-    )
-    expired_shipments = await db.shipments.update_many(
-        {"status": "pending", "pickup_date": {"$lt": now}},
-        {"$set": {"status": "expired"}}
-    )
-    logger.info(f"Cleanup: {expired_trips.modified_count} trips and {expired_shipments.modified_count} shipments marked expired")
-    
-    # Ensure admin accounts are always verified
-    await db.users.update_many(
-        {"role": "admin"},
-        {"$set": {"is_verified": True, "verification_status": "verified"}}
-    )
-    # Ensure all existing users have the new verification fields
-    await db.users.update_many(
-        {"verification_status": {"$exists": False}},
-        {"$set": {"verification_status": "pending", "id_document_url": None, "admin_note": None}}
-    )
-    # Migrate all sender/traveler roles to unified "user" role
-    await db.users.update_many(
-        {"role": {"$in": ["sender", "traveler"]}},
-        {"$set": {"role": "user"}}
-    )
-
-    # Backward-compatible transport migration. Existing trips were historically
-    # flight-only, so missing values default to plane. Demo notes that clearly
-    # describe rail/bus/overland journeys are upgraded to the matching mode.
-    await db.trips.update_many(
-        {"transport_mode": {"$exists": False}, "notes": {"$regex": "train|rail|eurostar", "$options": "i"}},
-        {"$set": {"transport_mode": "train"}}
-    )
-    await db.trips.update_many(
-        {"transport_mode": {"$exists": False}, "notes": {"$regex": "bus", "$options": "i"}},
-        {"$set": {"transport_mode": "bus"}}
-    )
-    await db.trips.update_many(
-        {"transport_mode": {"$exists": False}, "notes": {"$regex": "overland|drive|car|road", "$options": "i"}},
-        {"$set": {"transport_mode": "car"}}
-    )
-    await db.trips.update_many(
-        {"transport_mode": {"$exists": False}},
-        {"$set": {"transport_mode": "plane"}}
-    )
-
-    # ---------- LEGACY SEED CLEANUP ----------
-    # The previous seed assigned ALL listings to only 2 fake users (system@ / system2@),
-    # which made it look like a single person was flying between 5 countries at once.
-    # Remove legacy seed so the new, distributed seed can take over.
-    legacy_emails = ["system@sendjet.com", "system2@sendjet.com"]
-    legacy_users = await db.users.find(
-        {"email": {"$in": legacy_emails}}, {"_id": 0, "id": 1}
-    ).to_list(10)
-    legacy_ids = [u["id"] for u in legacy_users]
-    if legacy_ids:
-        await db.trips.delete_many({"traveler_id": {"$in": legacy_ids}})
-        await db.shipments.delete_many({"sender_id": {"$in": legacy_ids}})
-        await db.users.delete_many({"id": {"$in": legacy_ids}})
-        logger.info(f"Removed legacy seed: {len(legacy_ids)} users + their listings")
-
-    # ---------- ONE-TIME PHOTO CLEANUP ----------
-    # Photos feature was removed from the product (users felt the stock images looked fake).
-    # Strip the photos array from every shipment so the marketplace shows no images.
-    cleared = await db.shipments.update_many(
-        {"photos": {"$exists": True, "$ne": []}},
-        {"$set": {"photos": []}},
-    )
-    if cleared.modified_count:
-        logger.info(f"Cleared photos from {cleared.modified_count} shipments")
-
-    # ---------- DEMO PERSONAS & SAMPLE LISTINGS ----------
-    # Used to seed (first run) AND to self-heal demo listings when their dates expire.
-
-    traveler_personas = [
-        {"name": "Sarah Johnson",     "email": "sarah.j@demo.sendjet.com",     "phone": "+1-212-555-0101",   "rating": 4.9, "reviews": 18},
-        {"name": "Omar Hassan",       "email": "omar.h@demo.sendjet.com",      "phone": "+20-100-555-0102",  "rating": 4.8, "reviews": 12},
-        {"name": "Yuki Tanaka",       "email": "yuki.t@demo.sendjet.com",      "phone": "+81-90-5551-0103",  "rating": 5.0, "reviews": 9},
-        {"name": "James Mitchell",    "email": "james.m@demo.sendjet.com",     "phone": "+44-7700-900104",   "rating": 4.7, "reviews": 22},
-        {"name": "Ahmed Al-Rashid",   "email": "ahmed.ar@demo.sendjet.com",    "phone": "+966-50-555-0105",  "rating": 4.6, "reviews": 7},
-        {"name": "Lars Schmidt",      "email": "lars.s@demo.sendjet.com",      "phone": "+49-171-5550106",   "rating": 4.8, "reviews": 14},
-        {"name": "Wei Tan",           "email": "wei.t@demo.sendjet.com",       "phone": "+65-8555-0107",     "rating": 4.9, "reviews": 11},
-        {"name": "Fatima Saleh",      "email": "fatima.s@demo.sendjet.com",    "phone": "+961-3-555108",     "rating": 4.5, "reviews": 5},
-        {"name": "Dmitri Volkov",     "email": "dmitri.v@demo.sendjet.com",    "phone": "+7-903-555-0109",   "rating": 4.7, "reviews": 16},
-        {"name": "Emma Wilson",       "email": "emma.w@demo.sendjet.com",      "phone": "+61-400-555-110",   "rating": 4.9, "reviews": 20},
-        {"name": "Carlos Mendez",     "email": "carlos.m@demo.sendjet.com",    "phone": "+34-600-555-111",   "rating": 4.8, "reviews": 8},
-        {"name": "Priya Sharma",      "email": "priya.s@demo.sendjet.com",     "phone": "+91-98765-55112",   "rating": 4.6, "reviews": 13},
-    ]
-    sender_personas = [
-        {"name": "Leila Mansour",     "email": "leila.m@demo.sendjet.com",     "phone": "+971-50-555-0201",  "rating": 4.7, "reviews": 6},
-        {"name": "Pierre Dubois",     "email": "pierre.d@demo.sendjet.com",    "phone": "+33-6-5555-0202",   "rating": 4.9, "reviews": 15},
-        {"name": "Aylin Demir",       "email": "aylin.d@demo.sendjet.com",     "phone": "+90-532-555-0203",  "rating": 4.8, "reviews": 10},
-        {"name": "Khalid Al-Amri",    "email": "khalid.a@demo.sendjet.com",    "phone": "+966-55-555-0204",  "rating": 4.6, "reviews": 4},
-        {"name": "David Martinez",    "email": "david.m@demo.sendjet.com",     "phone": "+1-415-555-0205",   "rating": 5.0, "reviews": 21},
-        {"name": "Noha Ibrahim",      "email": "noha.i@demo.sendjet.com",      "phone": "+20-122-555-0206",  "rating": 4.7, "reviews": 9},
-        {"name": "Min-jun Kim",       "email": "minjun.k@demo.sendjet.com",    "phone": "+82-10-5555-0207",  "rating": 4.8, "reviews": 12},
-        {"name": "Aisyah Binti",      "email": "aisyah.b@demo.sendjet.com",    "phone": "+60-12-555-0208",   "rating": 4.5, "reviews": 3},
-        {"name": "Oliver Thompson",   "email": "oliver.t@demo.sendjet.com",    "phone": "+44-7700-900209",   "rating": 4.9, "reviews": 17},
-        {"name": "Anna Kuznetsova",   "email": "anna.k@demo.sendjet.com",      "phone": "+7-916-555-0210",   "rating": 4.6, "reviews": 8},
-        {"name": "Hiroshi Sato",      "email": "hiroshi.s@demo.sendjet.com",   "phone": "+81-80-5555-0211",  "rating": 4.8, "reviews": 11},
-        {"name": "Sofia Rossi",       "email": "sofia.r@demo.sendjet.com",     "phone": "+39-333-555-0212",  "rating": 4.7, "reviews": 6},
-    ]
-
-    # Trip templates — only route/mode combinations that are physically plausible.
-    # Demo data should never suggest that a car, bus or train crosses an ocean or
-    # uses a route without a realistic overland/rail connection.
-    trip_templates = [
-        # Plane
-        {"origin": {"lat": 40.7128, "lng": -74.0060, "address": "New York, United States"}, "destination": {"lat": 51.5074, "lng": -0.1278, "address": "London, United Kingdom"}, "dep_days": 7, "arr_days": 8, "available_weight": 20, "available_space": 60, "price_per_kg": 15, "notes": "Direct flight. Extra baggage space available.", "transport_mode": "plane"},
-        {"origin": {"lat": 30.0444, "lng": 31.2357, "address": "Cairo, Egypt"}, "destination": {"lat": 25.2048, "lng": 55.2708, "address": "Dubai, UAE"}, "dep_days": 5, "arr_days": 5, "available_weight": 15, "available_space": 50, "price_per_kg": 8, "notes": "Direct flight. Small and medium parcels welcome.", "transport_mode": "plane"},
-        {"origin": {"lat": 52.5200, "lng": 13.4050, "address": "Berlin, Germany"}, "destination": {"lat": 41.0082, "lng": 28.9784, "address": "Istanbul, Turkey"}, "dep_days": 10, "arr_days": 10, "available_weight": 12, "available_space": 45, "price_per_kg": 9, "notes": "Flight to Istanbul. Medium parcel capacity.", "transport_mode": "plane"},
-
-        # Train
-        {"origin": {"lat": 51.5074, "lng": -0.1278, "address": "London, United Kingdom"}, "destination": {"lat": 48.8566, "lng": 2.3522, "address": "Paris, France"}, "dep_days": 3, "arr_days": 3, "available_weight": 10, "available_space": 40, "price_per_kg": 12, "notes": "Eurostar journey. Small parcels preferred.", "transport_mode": "train"},
-        {"origin": {"lat": 52.5200, "lng": 13.4050, "address": "Berlin, Germany"}, "destination": {"lat": 53.5511, "lng": 9.9937, "address": "Hamburg, Germany"}, "dep_days": 4, "arr_days": 4, "available_weight": 8, "available_space": 30, "price_per_kg": 6, "notes": "Direct intercity train. Easy station handover.", "transport_mode": "train"},
-        {"origin": {"lat": 41.9028, "lng": 12.4964, "address": "Rome, Italy"}, "destination": {"lat": 45.4642, "lng": 9.1900, "address": "Milan, Italy"}, "dep_days": 8, "arr_days": 8, "available_weight": 9, "available_space": 35, "price_per_kg": 7, "notes": "High-speed train. Documents and compact parcels welcome.", "transport_mode": "train"},
-
-        # Car
-        {"origin": {"lat": 52.5200, "lng": 13.4050, "address": "Berlin, Germany"}, "destination": {"lat": 52.2297, "lng": 21.0122, "address": "Warsaw, Poland"}, "dep_days": 6, "arr_days": 6, "available_weight": 25, "available_space": 80, "price_per_kg": 6, "notes": "Driving via the A12/A2 corridor. Can arrange pickup along the route.", "transport_mode": "car"},
-        {"origin": {"lat": 48.1351, "lng": 11.5820, "address": "Munich, Germany"}, "destination": {"lat": 50.0755, "lng": 14.4378, "address": "Prague, Czechia"}, "dep_days": 9, "arr_days": 9, "available_weight": 20, "available_space": 70, "price_per_kg": 5, "notes": "Road trip to Prague. Flexible pickup for small parcels.", "transport_mode": "car"},
-        {"origin": {"lat": 48.2082, "lng": 16.3738, "address": "Vienna, Austria"}, "destination": {"lat": 47.4979, "lng": 19.0402, "address": "Budapest, Hungary"}, "dep_days": 11, "arr_days": 11, "available_weight": 18, "available_space": 60, "price_per_kg": 5, "notes": "Direct road journey. Space for small and medium parcels.", "transport_mode": "car"},
-
-        # Bus
-        {"origin": {"lat": 1.3521, "lng": 103.8198, "address": "Singapore"}, "destination": {"lat": 3.1390, "lng": 101.6869, "address": "Kuala Lumpur, Malaysia"}, "dep_days": 2, "arr_days": 2, "available_weight": 5, "available_space": 20, "price_per_kg": 7, "notes": "Cross-border coach trip. Documents and compact parcels only.", "transport_mode": "bus"},
-        {"origin": {"lat": 52.5200, "lng": 13.4050, "address": "Berlin, Germany"}, "destination": {"lat": 50.0755, "lng": 14.4378, "address": "Prague, Czechia"}, "dep_days": 7, "arr_days": 7, "available_weight": 7, "available_space": 25, "price_per_kg": 6, "notes": "Direct coach journey. Small parcel capacity.", "transport_mode": "bus"},
-        {"origin": {"lat": 40.4168, "lng": -3.7038, "address": "Madrid, Spain"}, "destination": {"lat": 41.3874, "lng": 2.1686, "address": "Barcelona, Spain"}, "dep_days": 12, "arr_days": 12, "available_weight": 8, "available_space": 30, "price_per_kg": 6, "notes": "Intercity coach. Compact parcels preferred.", "transport_mode": "bus"},
-    ]
-    shipment_templates = [
-        {"description": "Birthday gift package for family",       "weight": 3,   "dimensions": {"length": 30, "width": 20, "height": 15}, "origin": {"lat": 25.2048, "lng": 55.2708, "address": "Dubai, UAE"},               "destination": {"lat": 30.0444, "lng": 31.2357, "address": "Cairo, Egypt"},               "pickup_days": 4, "deadline_days": 10, "declared_value": 150},
-        {"description": "Important business documents",           "weight": 1,   "dimensions": {"length": 35, "width": 25, "height": 5},  "origin": {"lat": 48.8566, "lng": 2.3522,  "address": "Paris, France"},             "destination": {"lat": 51.5074, "lng": -0.1278, "address": "London, United Kingdom"},     "pickup_days": 2, "deadline_days": 5,  "declared_value": 50},
-        {"description": "Handmade jewelry collection",            "weight": 0.5, "dimensions": {"length": 20, "width": 15, "height": 10}, "origin": {"lat": 41.0082, "lng": 28.9784, "address": "Istanbul, Turkey"},         "destination": {"lat": 52.5200, "lng": 13.4050, "address": "Berlin, Germany"},            "pickup_days": 6, "deadline_days": 12, "declared_value": 500},
-        {"description": "Traditional spices and tea",             "weight": 5,   "dimensions": {"length": 40, "width": 30, "height": 20}, "origin": {"lat": 24.7136, "lng": 46.6753, "address": "Riyadh, Saudi Arabia"},     "destination": {"lat": 25.2048, "lng": 55.2708, "address": "Dubai, UAE"},                 "pickup_days": 3, "deadline_days": 7,  "declared_value": 80},
-        {"description": "Laptop and accessories for remote work", "weight": 4,   "dimensions": {"length": 45, "width": 35, "height": 15}, "origin": {"lat": 40.7128, "lng": -74.0060,"address": "New York, United States"},   "destination": {"lat": 34.0522, "lng": -118.2437,"address": "Los Angeles, United States"},"pickup_days": 5, "deadline_days": 8,  "declared_value": 1200},
-        {"description": "Baby clothes and toys",                  "weight": 2,   "dimensions": {"length": 50, "width": 40, "height": 30}, "origin": {"lat": 30.0444, "lng": 31.2357, "address": "Cairo, Egypt"},              "destination": {"lat": 31.2001, "lng": 29.9187, "address": "Alexandria, Egypt"},          "pickup_days": 1, "deadline_days": 3,  "declared_value": 120},
-        {"description": "University textbooks",                   "weight": 6,   "dimensions": {"length": 35, "width": 25, "height": 20}, "origin": {"lat": 37.5665, "lng": 126.9780,"address": "Seoul, South Korea"},        "destination": {"lat": 35.6762, "lng": 139.6503,"address": "Tokyo, Japan"},               "pickup_days": 7, "deadline_days": 14, "declared_value": 200},
-        {"description": "Organic skincare products",              "weight": 1.5, "dimensions": {"length": 25, "width": 20, "height": 15}, "origin": {"lat": 3.1390,  "lng": 101.6869,"address": "Kuala Lumpur, Malaysia"},     "destination": {"lat": 1.3521,  "lng": 103.8198,"address": "Singapore"},                  "pickup_days": 3, "deadline_days": 6,  "declared_value": 90},
-        {"description": "Vintage vinyl records collection",       "weight": 8,   "dimensions": {"length": 35, "width": 35, "height": 25}, "origin": {"lat": 51.5074, "lng": -0.1278, "address": "London, United Kingdom"},     "destination": {"lat": 40.7128, "lng": -74.0060,"address": "New York, United States"},    "pickup_days": 9, "deadline_days": 15, "declared_value": 350},
-        {"description": "Medical supplies and vitamins",          "weight": 2.5, "dimensions": {"length": 30, "width": 25, "height": 20}, "origin": {"lat": 55.7558, "lng": 37.6173, "address": "Moscow, Russia"},            "destination": {"lat": 50.4501, "lng": 30.5234, "address": "Kyiv, Ukraine"},              "pickup_days": 5, "deadline_days": 10, "declared_value": 180},
-        {"description": "Home-cooked snacks for a relative",      "weight": 3.5, "dimensions": {"length": 30, "width": 25, "height": 20}, "origin": {"lat": 35.6762, "lng": 139.6503,"address": "Tokyo, Japan"},              "destination": {"lat": 34.6937, "lng": 135.5023,"address": "Osaka, Japan"},               "pickup_days": 2, "deadline_days": 5,  "declared_value": 60},
-        {"description": "Leather handbag (designer)",             "weight": 1.2, "dimensions": {"length": 40, "width": 30, "height": 15}, "origin": {"lat": 41.9028, "lng": 12.4964, "address": "Rome, Italy"},               "destination": {"lat": 45.4642, "lng": 9.1900,  "address": "Milan, Italy"},               "pickup_days": 4, "deadline_days": 8,  "declared_value": 900},
-    ]
-
-    # ---------- ENSURE DEMO USERS EXIST (idempotent) ----------
-    from datetime import timedelta
-    import random as _rnd
-    _rnd.seed(42)
-    now = datetime.now(timezone.utc)
-
-    all_personas = traveler_personas + sender_personas
-    demo_emails = [p["email"] for p in all_personas]
-    existing_demo_users = await db.users.find(
-        {"email": {"$in": demo_emails}}, {"_id": 0}
-    ).to_list(50)
-    existing_demo_emails = {u["email"] for u in existing_demo_users}
-
-    new_user_docs = []
-    for p in all_personas:
-        if p["email"] in existing_demo_emails:
-            continue
-        joined = now - timedelta(days=_rnd.randint(30, 270), hours=_rnd.randint(0, 23))
-        new_user_docs.append({
-            "id": str(uuid.uuid4()), "email": p["email"], "password_hash": "nologin",
-            "full_name": p["name"], "role": "user", "phone": p["phone"], "avatar": None,
-            "rating": p["rating"], "total_reviews": p["reviews"],
-            "is_verified": True, "verification_status": "verified",
-            "id_document_url": None, "admin_note": None, "created_at": joined,
-        })
-    if new_user_docs:
-        await db.users.insert_many(new_user_docs)
-        logger.info(f"Created {len(new_user_docs)} new demo users")
-        existing_demo_users.extend(new_user_docs)
-
-    demo_user_by_email = {u["email"]: u for u in existing_demo_users}
-
-    def _aware(dt):
-        """Coerce MongoDB-returned naive datetimes to UTC-aware for safe arithmetic."""
-        if dt is None:
-            return now
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-    traveler_ids = [demo_user_by_email[p["email"]]["id"] for p in traveler_personas]
-    traveler_joined = [_aware(demo_user_by_email[p["email"]]["created_at"]) for p in traveler_personas]
-    sender_ids = [demo_user_by_email[p["email"]]["id"] for p in sender_personas]
-    sender_joined = [_aware(demo_user_by_email[p["email"]]["created_at"]) for p in sender_personas]
-
-    # ---------- SELF-HEAL DEMO LISTINGS ----------
-    # If demo trips/shipments have expired (dates in the past or status moved on),
-    # wipe their stale demo records and recreate fresh ones with future dates.
-    DEMO_SEED_VERSION = 2  # logical transport-mode routes
-    DEMO_TRIPS_TARGET = 12
-    DEMO_SHIPMENTS_TARGET = 12
-
-    active_demo_trips = await db.trips.count_documents({
-        "traveler_id": {"$in": traveler_ids},
-        "status": "active",
-        "departure_date": {"$gte": now},
-        "demo_seed_version": DEMO_SEED_VERSION,
-    })
-    pending_demo_shipments = await db.shipments.count_documents({
-        "sender_id": {"$in": sender_ids},
-        "status": "pending",
-        "pickup_date": {"$gte": now},
-    })
-
-    if active_demo_trips < DEMO_TRIPS_TARGET or pending_demo_shipments < DEMO_SHIPMENTS_TARGET:
-        logger.info(
-            f"Refreshing demo listings (active trips={active_demo_trips}, pending shipments={pending_demo_shipments})"
-        )
-        deleted_trips = await db.trips.delete_many({"traveler_id": {"$in": traveler_ids}})
-        deleted_ships = await db.shipments.delete_many({"sender_id": {"$in": sender_ids}})
-        logger.info(f"Removed stale demo data: {deleted_trips.deleted_count} trips, {deleted_ships.deleted_count} shipments")
-
-        trip_docs = []
-        for i, t in enumerate(trip_templates):
-            owner_joined = traveler_joined[i]
-            max_days_ago = min(25, max(1, (now - owner_joined).days - 1))
-            created_at = now - timedelta(days=_rnd.randint(1, max_days_ago), hours=_rnd.randint(0, 23))
-            trip_docs.append({
-                "id": str(uuid.uuid4()), "traveler_id": traveler_ids[i],
-                "origin": t["origin"], "destination": t["destination"],
-                "transport_mode": t.get("transport_mode", "plane"),
-                "demo_seed_version": DEMO_SEED_VERSION,
-                "departure_date": now + timedelta(days=t["dep_days"]),
-                "arrival_date": now + timedelta(days=t["arr_days"]),
-                "available_weight": t["available_weight"], "available_space": t["available_space"],
-                "price_per_kg": t["price_per_kg"], "notes": t["notes"],
-                "status": "active", "created_at": created_at,
-            })
-
-        shipment_docs = []
-        for i, s in enumerate(shipment_templates):
-            owner_joined = sender_joined[i]
-            max_days_ago = min(25, max(1, (now - owner_joined).days - 1))
-            created_at = now - timedelta(days=_rnd.randint(1, max_days_ago), hours=_rnd.randint(0, 23))
-            shipment_docs.append({
-                "id": str(uuid.uuid4()), "sender_id": sender_ids[i],
-                "description": s["description"], "weight": s["weight"],
-                "dimensions": s["dimensions"], "origin": s["origin"], "destination": s["destination"],
-                "pickup_date": now + timedelta(days=s["pickup_days"]),
-                "delivery_deadline": now + timedelta(days=s["deadline_days"]),
-                "declared_value": s["declared_value"],
-                "photos": [],
-                "status": "pending",
-                "status_history": [{"status": "pending", "timestamp": created_at, "description": "Shipment created"}],
-                "created_at": created_at,
-            })
-
-        await db.trips.insert_many(trip_docs)
-        await db.shipments.insert_many(shipment_docs)
-        logger.info(f"Refreshed demo listings: {len(trip_docs)} trips + {len(shipment_docs)} shipments inserted")
-
-
+async def initialize_demo_listings():
+    # No legacy migrations, expiration jobs, or real-record writes on restart.
+    if settings.enable_demo_data:
+        await seed_demo_data(db)
+        await refresh_demo_listings(db)
 
 
 @app.on_event("shutdown")

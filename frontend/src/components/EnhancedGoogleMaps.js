@@ -54,7 +54,7 @@ const EnhancedGoogleMaps = ({
   
   const { isLoaded, loadError } = useJsApiLoader({
     id: 'google-map-script',
-    googleMapsApiKey: process.env.REACT_APP_GOOGLE_MAPS_KEY || 'AIzaSyDemo123456789',
+    googleMapsApiKey: process.env.REACT_APP_GOOGLE_MAPS_KEY || '',
     libraries
   });
 

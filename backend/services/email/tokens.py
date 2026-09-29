@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from jose import JWTError, jwt
+from config import required_secret
 
 
 ALGORITHM = "HS256"
@@ -26,11 +27,8 @@ PASSWORD_RESET_TTL = timedelta(minutes=30)
 
 
 def _secret() -> str:
-    """Read the required signing secret from the private runtime environment."""
-    value = os.environ.get("SECRET_KEY", "")
-    if not value:
-        raise RuntimeError("Set SECRET_KEY before issuing email tokens")
-    return value
+    """Use the same explicit secret as login and confirmation codes."""
+    return required_secret(os.environ)
 
 
 # ---------------------------------------------------------------------------

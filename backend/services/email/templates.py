@@ -22,7 +22,7 @@ _VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
 def _brand_base() -> str:
     """Absolute base URL for hosted brand assets (logo) inside emails."""
-    return os.environ.get("PUBLIC_SITE_URL", "https://sendjet.de").rstrip("/")
+    return os.environ.get("PUBLIC_SITE_URL", "http://localhost:3000").strip().rstrip("/")
 
 
 def _logo_url() -> str:

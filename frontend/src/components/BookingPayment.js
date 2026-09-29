@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
@@ -27,6 +27,7 @@ const BookingPayment = () => {
   const [booking, setBooking] = useState(null);
   const [loading, setLoading] = useState(true);
   const [paying, setPaying] = useState(false);
+  const paymentInFlight = useRef(false);
 
   useEffect(() => {
     fetchBooking();
@@ -45,7 +46,8 @@ const BookingPayment = () => {
   };
 
   const handlePayment = async () => {
-    if (paying || !booking || !matchActions(booking.match, user?.id).canPay) return;
+    if (paymentInFlight.current || !booking || !matchActions(booking.match, user?.id).canPay) return;
+    paymentInFlight.current = true;
     setPaying(true);
     try {
       const response = await axios.post('/payments/checkout', {
@@ -73,6 +75,7 @@ const BookingPayment = () => {
         toast.error(detail || 'Failed to initiate payment. Please try again.');
       }
     } finally {
+      paymentInFlight.current = false;
       setPaying(false);
     }
   };
