@@ -49,7 +49,7 @@ const MatchRequests = () => {
     setBusy(id);
     try {
       await axios.put(`/matches/${id}/${action}`);
-      toast.success(action === 'accept' ? 'Match accepted — awaiting sender payment' : 'Request declined');
+      toast.success(action === 'accept' ? 'Match accepted — awaiting sender payment' : action === 'cancel' ? 'Unpaid booking cancelled' : 'Request declined');
       await fetchRequests();
     } catch (err) {
       toast.error(err.response?.data?.detail || 'Could not update this request');
@@ -75,6 +75,10 @@ const MatchRequests = () => {
       ) : requests.map(({ match, shipment, trip, sender, traveler }) => {
         const otherUser = match.sender_id === user?.id ? traveler : sender;
         const actions = matchActions(match, user?.id);
+        const canCancel = [match.sender_id, match.traveler_id].includes(user?.id)
+          && (match.status === 'accepted' || (match.status === 'pending' && match.requested_by === user?.id))
+          && !match.payment_intent_id
+          && !['paid', 'escrowed', 'released', 'refunded'].includes(match.payment_status);
         return (
           <Card key={match.id} data-testid={`match-${match.id}`}>
             <CardHeader>
@@ -93,6 +97,7 @@ const MatchRequests = () => {
                   <Button disabled={busy === match.id} onClick={() => respond(match.id, 'accept')} data-testid={`accept-match-${match.id}`}>Accept</Button>
                   <Button variant="outline" disabled={busy === match.id} onClick={() => respond(match.id, 'reject')} data-testid={`reject-match-${match.id}`}>Decline</Button>
                 </>}
+                {canCancel && <Button variant="outline" disabled={busy === match.id} onClick={() => respond(match.id, 'cancel')}>Cancel booking</Button>}
                 {actions.canPay && <Button onClick={() => navigate(`/booking/${match.id}/payment`)}>Pay Now</Button>}
                 {actions.canTrack && <Button onClick={() => navigate(`/shipment/${match.shipment_id}`)}>Track shipment</Button>}
               </div>

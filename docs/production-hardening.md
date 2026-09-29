@@ -67,8 +67,11 @@ New payment transactions also use a unique deterministic `_id` per session.
 
 Known sessions are retrieved and reused only while open and unpaid. Stripe-paid
 sessions reconcile through the existing confirmation flow. Complete/processing
-sessions block another checkout. Only Stripe-confirmed expired/unpaid sessions
-allow an atomic rotation to a new attempt. Provider failures do not rotate the key.
+sessions block another checkout. For journey-linked bookings, a Stripe-confirmed
+expired/unpaid session cancels the reservation; a new request must reserve capacity
+again. Ambiguous historical attempts stay blocked for reconciliation. Legacy
+bookings without a journey retain their existing expired-session rotation behavior.
+Provider failures do not rotate the key.
 If a create response was lost, the same persisted attempt recovers it. Unknown
 outcomes older than 23 hours block for operator reconciliation because Stripe may
 prune idempotency keys after 24 hours. Multiple pre-hardening transactions block
@@ -78,6 +81,37 @@ otherwise non-payable matches cannot create another session.
 Pay Now has an immediate ref guard plus disabled/loading state. Redirect hosts
 come exclusively from PUBLIC_SITE_URL, not the submitted browser origin.
 Amounts, currency, metadata, and mode are checked before payment reconciliation.
+
+## Journey capacity
+
+Stored `available_weight` (kg) and `available_space` (litres) remain the offered
+totals. `capacity_size` is descriptive; it is not an additional capacity counter.
+Acceptance snapshots shipment weight and dimensions (cm3 converted to litres) in
+`capacity_claims` on the journey. A `capacity_revision` compare-and-set serializes
+claims across workers before the shipment is assigned or checkout is started.
+No replica set, startup migration, or production-data rewrite is required.
+
+Marketplace and match-option reads subtract accepted/payment_pending/paid/
+in_progress/completed allocations, including legacy matches without snapshots.
+They expose remaining capacity only for future `active` journeys; exhausted or
+unknown legacy capacity is hidden. Missing/zero legacy volume means an unspecified
+volume limit, so only weight is enforced on those records. Invalid weights or
+shipment dimensions require reconciliation rather than invented capacity.
+
+Both parties can cancel accepted bookings before checkout; the requester can
+cancel a pending request. Checkout claims payment_pending before provider calls,
+preventing a simultaneous cancellation. Started/unknown payments remain reserved;
+verified Stripe expiration (webhook, status polling, or checkout retry) releases
+only an unambiguous expired/unpaid reservation. No arbitrary local timer frees a
+potentially payable booking. Accepted requests without checkout remain reserved
+until cancelled. Delivery/completion never releases capacity for the same journey.
+Snapshots preserve consumption after a delivered shipment is deleted. An interrupted
+acceptance can conservatively retain a claim until its request is cancelled/rejected.
+
+Journey cancellation retains its record and is blocked while claims/bookings remain.
+The old conversation booking route now requires a journey and creates a normal
+request instead of bypassing acceptance. Existing journey-less bookings are not
+silently assigned to an inferred journey or migrated.
 
 ## Verified webhooks
 

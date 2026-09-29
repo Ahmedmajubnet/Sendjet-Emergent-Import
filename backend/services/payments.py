@@ -9,6 +9,7 @@ import httpx
 import stripe
 from fastapi import HTTPException
 from pymongo.errors import DuplicateKeyError
+from services.capacity import reserve_capacity, cancel_unpaid_match
 
 
 def cents(amount):
@@ -89,6 +90,14 @@ async def checkout_for_match(db, match, gateway, site_url, reconcile):
         if (not current or current.get("status") not in {"accepted", "payment_pending"}
                 or current.get("payment_status") in {"escrowed", "released", "paid"}):
             raise HTTPException(409, "Booking is already paid or no longer payable")
+        if current.get("trip_id"):
+            await reserve_capacity(db, current)
+            # Win against cancellation before creating any external payment attempt.
+            if current["status"] == "accepted":
+                claimed = await db.matches.update_one(
+                    {"id": match_id, "status": "accepted"}, {"$set": {"status": "payment_pending"}})
+                if not claimed.modified_count:
+                    continue
         attempt = await db.checkout_attempts.find_one({"_id": match_id})
         if not attempt:
             old = await db.payment_transactions.find({"match_id": match_id}).to_list(None)
@@ -144,6 +153,14 @@ async def checkout_for_match(db, match, gateway, site_url, reconcile):
             await reconcile(saved or transaction)
             raise HTTPException(409, "Payment already completed; open shipment tracking")
         if session.get("status") == "expired" and session.get("payment_status") == "unpaid":
+            if current.get("trip_id"):
+                # Do not rotate a payable session while another worker releases
+                # its capacity. A fresh request must acquire a new reservation.
+                latest = await db.matches.find_one({"id": match_id})
+                released = await cancel_unpaid_match(db, latest, expired_session=session)
+                if not released:
+                    raise HTTPException(409, "Expired checkout requires reservation reconciliation")
+                raise HTTPException(409, "Checkout expired; reopen requests and arrange a new reservation")
             # Only authoritative expiration permits a new logical attempt.
             await db.checkout_attempts.update_one({"_id": match_id, "attempt_id": attempt["attempt_id"]},
                 {"$set": {"attempt_id": str(uuid.uuid4()), "created_at": datetime.now(timezone.utc), "session_id": None}})

@@ -21,7 +21,7 @@ import {
 import { toast } from 'sonner';
 import axios from 'axios';
 import { motion } from 'framer-motion';
-import { TRANSPORT_MODES, getTransportMode, getCapacitySize, formatTripPrice, TransportModeBadge } from './TransportModeBadge';
+import { TRANSPORT_MODES, getTransportMode, formatTripPrice, TransportModeBadge } from './TransportModeBadge';
 import MatchRequestDialog from './MatchRequestDialog';
 
 const cardEntrance = (idx) => ({
@@ -291,11 +291,11 @@ const MarketPlace = () => {
                     </div>
                     <div className="flex items-center gap-1">
                       <Weight className="h-3 w-3 text-gray-400" />
-                      <span>{trip.available_weight}kg max</span>
+                      <span>{trip.available_weight}kg remaining</span>
                     </div>
                     <div className="flex items-center gap-1">
                       <Package className="h-3 w-3 text-gray-400" />
-                      <span>{getCapacitySize(trip.capacity_size)?.label || `${trip.available_space}L`}</span>
+                      <span>{trip.available_space > 0 ? `${trip.available_space}L remaining` : "Space not specified"}</span>
                     </div>
                     <div className="flex items-center gap-1">
                       <DollarSign className="h-3 w-3 text-gray-400" />

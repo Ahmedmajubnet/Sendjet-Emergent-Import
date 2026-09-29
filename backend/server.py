@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 from config import load_settings
 from services.demo import seed_demo_data, refresh_demo_listings
 from services.payments import StripeGateway, checkout_for_match, verify_webhook, validate_payment_session
+from services.capacity import available_trips, reserve_capacity, cancel_unpaid_match, allocations
 import httpx
 
 # Email subsystem (provider-agnostic, Resend by default; falls back to no-op
@@ -1043,7 +1044,7 @@ async def get_user_match_options(user_id: str, current_user: User = Depends(get_
     public_only = {"visibility": {"$ne": "private"}}
     target_trips = await db.trips.find(
         {"traveler_id": user_id, "status": "active", "departure_date": {"$gte": now}, **public_only},
-        {"_id": 0, "id": 1, "origin": 1, "destination": 1, "departure_date": 1, "transport_mode": 1, "pricing_model": 1, "price_per_kg": 1, "fixed_price": 1, "capacity_size": 1, "available_weight": 1}
+        {"_id": 0, "id": 1, "origin": 1, "destination": 1, "departure_date": 1, "transport_mode": 1, "pricing_model": 1, "price_per_kg": 1, "fixed_price": 1, "capacity_size": 1, "available_weight": 1, "available_space": 1, "capacity_claims": 1, "status": 1}
     ).sort("departure_date", 1).to_list(50)
     target_shipments = await db.shipments.find(
         {"sender_id": user_id, "status": "pending", "pickup_date": {"$gte": now}, **public_only},
@@ -1055,7 +1056,7 @@ async def get_user_match_options(user_id: str, current_user: User = Depends(get_
     ).sort("pickup_date", 1).to_list(50)
     my_trips = await db.trips.find(
         {"traveler_id": current_user.id, "status": "active", "departure_date": {"$gte": now}},
-        {"_id": 0, "id": 1, "origin": 1, "destination": 1, "departure_date": 1, "transport_mode": 1, "capacity_size": 1, "available_weight": 1, "visibility": 1}
+        {"_id": 0, "id": 1, "origin": 1, "destination": 1, "departure_date": 1, "transport_mode": 1, "capacity_size": 1, "available_weight": 1, "visibility": 1, "available_space": 1, "capacity_claims": 1, "status": 1}
     ).sort("departure_date", 1).to_list(50)
 
     existing_matches = await db.matches.find({
@@ -1068,10 +1069,10 @@ async def get_user_match_options(user_id: str, current_user: User = Depends(get_
 
     return {
         "existing_matches": [Match(**m).dict() for m in existing_matches],
-        "target_trips": target_trips,
+        "target_trips": await available_trips(db, target_trips),
         "target_shipments": target_shipments,
         "my_shipments": my_shipments,
-        "my_trips": my_trips,
+        "my_trips": await available_trips(db, my_trips),
     }
 
 # Shipment-based messaging endpoints
@@ -1392,51 +1393,11 @@ async def create_booking_from_conversation(
     if shipment.get("status") != "pending":
         raise HTTPException(status_code=409, detail="Shipment is no longer available for booking")
 
-    # Calculate commission
-    price_agreed = booking_data.get("price_agreed", 0.0)
-    commission_percent = 10.0  # 10% platform fee
-    commission_amount = price_agreed * (commission_percent / 100)
-    traveler_payout = price_agreed - commission_amount
-    
-    # Create match/booking
-    match = Match(
-        shipment_id=shipment_id,
-        traveler_id=current_user.id,
-        sender_id=sender_id,
-        price_agreed=price_agreed,
-        status="payment_pending",
-        payment_status="unpaid",
-        platform_commission_percent=commission_percent,
-        platform_commission_amount=commission_amount,
-        traveler_payout_amount=traveler_payout,
-        conversation_id=conversation_id
-    )
-    
-    reserved = await db.shipments.update_one(
-        {"id": shipment_id, "status": "pending"},
-        {"$set": {"status": "matched", "assigned_match_id": match.id}},
-    )
-    if not reserved.modified_count:
-        raise HTTPException(status_code=409, detail="Shipment is no longer available for booking")
-    await db.matches.insert_one(match.dict())
+    return await create_match_request({
+        "shipment_id": shipment_id, "trip_id": booking_data.get("trip_id"),
+        "price_offered": booking_data.get("price_agreed"), "conversation_id": conversation_id,
+    }, current_user)
 
-    # Send notification to sender
-    await notification_manager.send_notification(sender_id, {
-        "type": "booking_request",
-        "id": match.id,
-        "title": "Booking Confirmed - Payment Required",
-        "message": f"{current_user.full_name} will carry your package for ${price_agreed}. Please proceed with payment.",
-        "match_id": match.id,
-        "shipment_id": shipment_id,
-        "price": price_agreed,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "link": f"/booking/{match.id}/payment"
-    })
-    
-    return {
-        "match": match.dict(),
-        "message": "Booking created successfully. Sender will be notified to proceed with payment."
-    }
 
 # Get booking details
 @api_router.get("/bookings/{match_id}")
@@ -2060,11 +2021,10 @@ async def delete_shipment(shipment_id: str, current_user: User = Depends(get_cur
     # Block deletion only if shipment is actively in transit (not yet delivered)
     if shipment["status"] in ["matched", "picked_up", "in_transit", "arrived"]:
         raise HTTPException(status_code=400, detail="Cannot delete an assigned shipment before delivery")
-    # Cancel any pending/accepted matches for this shipment
-    await db.matches.update_many(
-        {"shipment_id": shipment_id, "status": {"$in": ["pending", "accepted", "payment_pending"]}},
-        {"$set": {"status": "cancelled"}}
-    )
+    outstanding = await db.matches.find({"shipment_id": shipment_id,
+        "status": {"$in": ["pending", "accepted", "payment_pending"]}}).to_list(None)
+    for match in outstanding:
+        await cancel_unpaid_match(db, match)
     await db.shipments.delete_one({"id": shipment_id})
     return {"message": "Shipment deleted successfully"}
 
@@ -2255,6 +2215,7 @@ async def get_all_trips():
         },
         {"_id": 0}
     ).to_list(1000)
+    trips = await available_trips(db, trips)
     await _attach_owner_info(trips, id_field="traveler_id", prefix="traveler")
     return [Trip(**t) for t in trips]
 
@@ -2266,23 +2227,17 @@ async def delete_trip(trip_id: str, current_user: User = Depends(get_current_use
         raise HTTPException(status_code=404, detail="Trip not found")
     if trip["traveler_id"] != current_user.id:
         raise HTTPException(status_code=403, detail="Only the trip owner can delete it")
-    # Block deletion only if there's an actively in-transit shipment on this trip
-    active_shipment = await db.matches.find_one({
-        "trip_id": trip_id,
-        "status": {"$in": ["paid", "in_progress"]}
-    })
-    if active_shipment:
-        # Check if the associated shipment is in transit
-        shipment = await db.shipments.find_one({"id": active_shipment.get("shipment_id")}, {"_id": 0})
-        if shipment and shipment.get("status") in ["picked_up", "in_transit"]:
-            raise HTTPException(status_code=400, detail="Cannot delete trip while a shipment is in transit")
-    # Cancel any pending matches for this trip
-    await db.matches.update_many(
-        {"trip_id": trip_id, "status": {"$in": ["pending", "accepted", "payment_pending"]}},
-        {"$set": {"status": "cancelled"}}
-    )
-    await db.trips.delete_one({"id": trip_id})
-    return {"message": "Trip deleted successfully"}
+    # Keep booked journey records: deletion must not erase capacity/payment evidence.
+    if await allocations(db, trip) or await db.matches.find_one({
+            "trip_id": trip_id, "status": {"$in": ["accepted", "payment_pending", "paid", "in_progress", "completed"]}}):
+        raise HTTPException(409, "Resolve journey bookings before cancelling this journey")
+    query = {"id": trip_id, "capacity_revision": trip.get("capacity_revision", {"$exists": False})}
+    changed = await db.trips.update_one(query, {"$set": {"status": "cancelled"}})
+    if not changed.modified_count:
+        raise HTTPException(409, "Journey changed; refresh before cancelling")
+    await db.matches.update_many({"trip_id": trip_id, "status": "pending"}, {"$set": {"status": "cancelled"}})
+    return {"message": "Journey cancelled successfully"}
+
 
 
 # ===== REVIEW ENDPOINTS =====
@@ -2904,11 +2859,18 @@ async def accept_match_request(match_id: str, current_user: User = Depends(get_c
     if match["status"] != "pending":
         raise HTTPException(status_code=400, detail="Match request already processed")
     
+    await reserve_capacity(db, match)
     reserved = await db.shipments.update_one(
         {"id": match["shipment_id"], "status": "pending"},
         {"$set": {"status": "matched", "assigned_match_id": match_id}},
     )
     if not reserved.modified_count:
+        shipment = await db.shipments.find_one({"id": match["shipment_id"]})
+        if not shipment or shipment.get("assigned_match_id") != match_id:
+            # Another booking owns the shipment. Terminal state releases this
+            # claim; never release the winning concurrent acceptance's claim.
+            await db.matches.update_one({"id": match_id, "status": "pending"},
+                                        {"$set": {"status": "rejected"}})
         raise HTTPException(status_code=409, detail="Shipment is no longer available for matching")
     accepted = await db.matches.update_one(
         {"id": match_id, "status": "pending"},
@@ -2951,6 +2913,17 @@ async def accept_match_request(match_id: str, current_user: User = Depends(get_c
         })
     
     return {"message": "Match accepted successfully", "match_id": match_id}
+
+@api_router.put("/matches/{match_id}/cancel")
+async def cancel_match_request(match_id: str, current_user: User = Depends(get_current_user)):
+    match = await db.matches.find_one({"id": match_id}, {"_id": 0})
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if current_user.id not in {match["sender_id"], match["traveler_id"]}:
+        raise HTTPException(403, "Not your match request")
+    await cancel_unpaid_match(db, match)
+    return {"message": "Unpaid booking cancelled", "match_id": match_id}
+
 
 # Reject match request
 @api_router.put("/matches/{match_id}/reject")
@@ -3169,6 +3142,10 @@ async def get_payment_status(
     confirmation_status = {}
     if new_payment_status == "paid":
         confirmation_status = await _complete_paid_payment(transaction, request)
+    elif checkout_status.get("status") == "expired":
+        match = await db.matches.find_one({"id": transaction["match_id"]})
+        if match and match.get("trip_id"):
+            await cancel_unpaid_match(db, match, expired_session=checkout_status)
 
     return {
         "status": checkout_status["status"],
@@ -3283,6 +3260,10 @@ async def stripe_webhook(request: Request):
     )
     if session["payment_status"] == "paid":
         await _complete_paid_payment(transaction, request)
+    elif session.get("status") == "expired":
+        match = await db.matches.find_one({"id": transaction["match_id"]})
+        if match and match.get("trip_id"):
+            await cancel_unpaid_match(db, match, expired_session=session)
     return {"status": "ok"}
 
 
