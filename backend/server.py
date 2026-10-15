@@ -3282,54 +3282,33 @@ async def health_check():
 
 @app.get("/api/sitemap.xml")
 async def sitemap():
-    """Dynamic sitemap for search engines.
-    
-    Includes:
-      - Static public routes (landing, marketplace, about, faq, safety, etc.)
-      - All active trips and shipments (public detail pages)
+    """Sitemap of public pages that are accessible without authentication.
+
+    Individual trip URLs have no public detail route, and shipment details
+    require login, so neither belongs in a search-engine sitemap.
     """
     from fastapi.responses import Response
-    
-    base = settings.public_site_url
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    
-    urls = [
-        (f"{base}/",           now, "daily",   "1.0"),
-        (f"{base}/marketplace", now, "hourly", "0.9"),
-        (f"{base}/about",      now, "monthly", "0.6"),
-        (f"{base}/faq",        now, "monthly", "0.7"),
-        (f"{base}/safety",     now, "monthly", "0.6"),
-        (f"{base}/contact",    now, "monthly", "0.4"),
-        (f"{base}/impressum",  now, "yearly",  "0.2"),
-        (f"{base}/legal",      now, "yearly",  "0.2"),
+    from xml.sax.saxutils import escape
+
+    base = settings.public_site_url.rstrip("/")
+    paths = (
+        "/",
+        "/marketplace",
+        "/about",
+        "/faq",
+        "/safety",
+        "/contact",
+        "/impressum",
+        "/legal",
+    )
+
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     ]
-    
-    # Active trips (public browsable listings). Cap at 2000 for sitemap size sanity.
-    try:
-        trips_cursor = db.trips.find(
-            {"status": "active"}, {"_id": 0, "id": 1, "created_at": 1}
-        ).limit(2000)
-        async for t in trips_cursor:
-            lastmod = str(t.get("created_at", now))[:10] or now
-            urls.append((f"{base}/trip/{t['id']}", lastmod, "weekly", "0.7"))
-        
-        shipments_cursor = db.shipments.find(
-            {"status": {"$in": ["pending", "matched"]}}, {"_id": 0, "id": 1, "created_at": 1}
-        ).limit(2000)
-        async for s in shipments_cursor:
-            lastmod = str(s.get("created_at", now))[:10] or now
-            urls.append((f"{base}/shipment/{s['id']}", lastmod, "weekly", "0.6"))
-    except Exception as e:
-        logger.warning(f"sitemap listing scan skipped: {e}")
-    
-    parts = ['<?xml version="1.0" encoding="UTF-8"?>',
-             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
-    for loc, lastmod, freq, prio in urls:
-        parts.append(
-            f"<url><loc>{loc}</loc><lastmod>{lastmod}</lastmod>"
-            f"<changefreq>{freq}</changefreq><priority>{prio}</priority></url>"
-        )
+    parts.extend(f"<url><loc>{escape(base + path)}</loc></url>" for path in paths)
     parts.append("</urlset>")
+    # Omit <lastmod> rather than claiming static pages change every day.
     return Response(content="\n".join(parts), media_type="application/xml")
 
 
