@@ -12,6 +12,7 @@ Disallow: /payment-success
 Disallow: /payment-cancelled
 Disallow: /create-trip
 Disallow: /create-shipment
+Allow: /api/sitemap.xml
 Disallow: /api/
 
 # Sitemap
